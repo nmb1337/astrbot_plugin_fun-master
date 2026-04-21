@@ -1,0 +1,92 @@
+{
+  "random_reward_chance_percent": {
+    "description": "聊天触发随机奖励的概率（百分比）",
+    "type": "int",
+    "default": 5
+  },
+  "random_reward_min": {
+    "description": "随机奖励积分最小值",
+    "type": "int",
+    "default": 1
+  },
+  "random_reward_max": {
+    "description": "随机奖励积分最大值",
+    "type": "int",
+    "default": 10
+  },
+  "chat_reward_cooldown_seconds": {
+    "description": "同一用户触发聊天奖励检测的冷却秒数",
+    "type": "int",
+    "default": 30
+  },
+  "sign_in_points": {
+    "description": "每日签到固定奖励积分",
+    "type": "int",
+    "default": 8
+  },
+  "sign_in_streak_bonus_per_day": {
+    "description": "连续签到每天额外增加的积分",
+    "type": "int",
+    "default": 2
+  },
+  "sign_in_streak_bonus_max": {
+    "description": "连续签到加成积分上限",
+    "type": "int",
+    "default": 30
+  },
+  "lottery_cost_points": {
+    "description": "每次抽奖消耗积分",
+    "type": "int",
+    "default": 10
+  },
+  "lottery_prize_1_points": {
+    "description": "一等奖奖励积分",
+    "type": "int",
+    "default": 100
+  },
+  "lottery_prize_1_chance_percent": {
+    "description": "一等奖概率（百分比）",
+    "type": "int",
+    "default": 1
+  },
+  "lottery_prize_2_points": {
+    "description": "二等奖奖励积分",
+    "type": "int",
+    "default": 30
+  },
+  "lottery_prize_2_chance_percent": {
+    "description": "二等奖概率（百分比）",
+    "type": "int",
+    "default": 5
+  },
+  "lottery_prize_3_points": {
+    "description": "三等奖奖励积分",
+    "type": "int",
+    "default": 10
+  },
+  "lottery_prize_3_chance_percent": {
+    "description": "三等奖概率（百分比）",
+    "type": "int",
+    "default": 20
+  },
+  "lottery_pity_threshold": {
+    "description": "抽奖保底阈值：连续未中奖多少次后下次必出三等奖，0为关闭",
+    "type": "int",
+    "default": 10
+  },
+  "redeem_cost_points": {
+    "description": "固定兑换需要消耗的积分",
+    "type": "int",
+    "default": 100
+  },
+  "redeem_notify_qq": {
+    "description": "兑换后通知的 QQ 号",
+    "type": "string",
+    "default": ""
+  },
+  "leaderboard_default_size": {
+    "description": "排行榜默认展示人数",
+    "type": "int",
+    "default": 10
+  }
+}
