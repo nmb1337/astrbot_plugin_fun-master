@@ -100,6 +100,24 @@
     "type": "string",
     "default": ""
   },
+  "group_enable_private": {
+    "description": "私聊是否启用积分功能",
+    "hint": "当关闭时，私聊中所有积分相关指令不可用。",
+    "type": "bool",
+    "default": true
+  },
+  "group_whitelist": {
+    "description": "群白名单",
+    "hint": "支持添加多个群号。白名单非空时，仅白名单群会启用积分功能。",
+    "type": "list",
+    "default": []
+  },
+  "group_blacklist": {
+    "description": "群黑名单",
+    "hint": "支持添加多个群号。黑名单优先级高于白名单。",
+    "type": "list",
+    "default": []
+  },
   "dashboard_enabled": {
     "description": "启用本地积分看板网站",
     "hint": "启用后可直接通过浏览器访问本地端口查看积分与兑换记录。",

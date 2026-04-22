@@ -69,6 +69,138 @@ class PointsPlugin(Star):
             return value.strip().lower() in {"1", "true", "yes", "on", "y"}
         return bool(value)
 
+    def _save_plugin_config(self) -> None:
+        save_fn = getattr(self.config, "save_config", None)
+        if callable(save_fn):
+            try:
+                save_fn()
+            except Exception as exc:
+                logger.warning(f"保存插件配置失败: {exc}")
+
+    @staticmethod
+    def _normalize_group_id(value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if text.isdigit():
+            return text
+        match = re.search(r"\d{5,}", text)
+        if match:
+            return match.group(0)
+        return text
+
+    @staticmethod
+    def _parse_id_text(value: Any, normalizer) -> list[str]:
+        items: list[str] = []
+        if isinstance(value, list):
+            for item in value:
+                items.append(str(item))
+        else:
+            text = str(value or "")
+            items = re.split(r"[,，;；\n\r\t ]+", text)
+
+        result: list[str] = []
+        seen = set()
+        for item in items:
+            normalized = normalizer(item)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append(normalized)
+        return result
+
+    def _cfg_group_id_list(self, key: str) -> list[str]:
+        raw = ""
+        if isinstance(self.config, dict):
+            raw = self.config.get(key, "")
+        return self._parse_id_text(raw, self._normalize_group_id)
+
+    def _set_group_id_list(self, key: str, values: list[str]) -> None:
+        if isinstance(self.config, dict):
+            self.config[key] = values
+        self._save_plugin_config()
+
+    @staticmethod
+    def _get_event_group_id(event: AstrMessageEvent) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        group_id = getattr(message_obj, "group_id", "")
+        return str(group_id or "").strip()
+
+    def _is_event_allowed(self, event: AstrMessageEvent) -> bool:
+        group_id = self._get_event_group_id(event)
+        if not group_id:
+            return self._cfg_bool("group_enable_private", True)
+
+        whitelist = set(self._cfg_group_id_list("group_whitelist"))
+        blacklist = set(self._cfg_group_id_list("group_blacklist"))
+
+        if group_id in blacklist:
+            return False
+        if whitelist and group_id not in whitelist:
+            return False
+        return True
+
+    def _blocked_result(self, event: AstrMessageEvent):
+        if self._is_event_allowed(event):
+            return None
+        return event.plain_result("当前群未开启积分功能，请联系管理员设置白名单/黑名单。")
+
+    def _resolve_target_group(self, event: AstrMessageEvent, group_id: str = "") -> str:
+        target = self._normalize_group_id(group_id)
+        if target:
+            return target
+        return self._get_event_group_id(event)
+
+    def _extract_message_components(self, event: AstrMessageEvent) -> list[Any]:
+        message_obj = getattr(event, "message_obj", None)
+        components = getattr(message_obj, "message", None)
+        if isinstance(components, list):
+            return components
+
+        get_messages_fn = getattr(event, "get_messages", None)
+        if callable(get_messages_fn):
+            try:
+                messages = get_messages_fn()
+                if isinstance(messages, list):
+                    return messages
+            except Exception:
+                pass
+        return []
+
+    def _is_message_to_bot(self, event: AstrMessageEvent) -> bool:
+        # 私聊天然是和机器人聊天。
+        if not self._get_event_group_id(event):
+            return True
+
+        message_obj = getattr(event, "message_obj", None)
+        self_id = str(getattr(message_obj, "self_id", "")).strip()
+
+        for comp in self._extract_message_components(event):
+            qq = None
+            if isinstance(comp, dict):
+                if str(comp.get("type", "")).lower() == "at":
+                    qq = comp.get("qq") or comp.get("id") or comp.get("target")
+            else:
+                if hasattr(comp, "qq"):
+                    qq = getattr(comp, "qq")
+                elif str(getattr(comp, "type", "")).lower() == "at":
+                    qq = getattr(comp, "target", None) or getattr(comp, "id", None)
+
+            if qq is None:
+                continue
+            if self_id and str(qq).strip() == self_id:
+                return True
+
+        # 兜底：兼容部分平台 raw_message 的 at 格式。
+        raw_message = str(getattr(message_obj, "raw_message", ""))
+        if self_id and (
+            f"qq={self_id}" in raw_message
+            or f'"qq":"{self_id}"' in raw_message
+            or f"'qq': '{self_id}'" in raw_message
+        ):
+            return True
+        return False
+
     async def _load_data(self) -> dict[str, Any]:
         data = await self.get_kv_data(self.DATA_KEY, {})
         if not isinstance(data, dict):
@@ -233,6 +365,9 @@ class PointsPlugin(Star):
         return None
 
     async def _start_dashboard_server(self) -> None:
+        if self._dashboard_runner is not None:
+            return
+
         if not self._cfg_bool("dashboard_enabled", True):
             self._dashboard_url = ""
             self._dashboard_error = ""
@@ -402,6 +537,12 @@ class PointsPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def random_chat_reward(self, event: AstrMessageEvent):
         """聊天概率触发随机积分奖励。"""
+        if not self._is_event_allowed(event):
+            return
+
+        if not self._is_message_to_bot(event):
+            return
+
         message_str = (event.message_str or "").strip()
         if not message_str:
             return
@@ -442,6 +583,11 @@ class PointsPlugin(Star):
     @filter.command("签到")
     async def sign_in(self, event: AstrMessageEvent):
         """每日签到领取基础积分。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         sender_id = str(event.get_sender_id())
         sender_name = event.get_sender_name() or sender_id
         today = date.today().isoformat()
@@ -482,6 +628,11 @@ class PointsPlugin(Star):
     @filter.command("查询", alias={"余额", "我的积分"})
     async def query_points(self, event: AstrMessageEvent, qq: str = ""):
         """查询自己或指定 QQ 的积分。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         sender_id = str(event.get_sender_id())
         sender_name = event.get_sender_name() or sender_id
         target_id = qq.strip() or sender_id
@@ -500,6 +651,11 @@ class PointsPlugin(Star):
     @filter.command("排行", alias={"排行榜"})
     async def rank_points(self, event: AstrMessageEvent, top_n: int = 0):
         """查看积分排行榜。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         if top_n <= 0:
             top_n = self._cfg_int("leaderboard_default_size", 10, 1, 50)
         top_n = min(top_n, 50)
@@ -527,6 +683,11 @@ class PointsPlugin(Star):
     @filter.command("抽奖")
     async def lottery_draw(self, event: AstrMessageEvent, times: int = 1):
         """消耗积分进行抽奖，支持一等奖/二等奖/三等奖。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         if times <= 0:
             yield event.plain_result("抽奖次数必须大于 0。")
             return
@@ -599,6 +760,11 @@ class PointsPlugin(Star):
     @filter.command("兑换")
     async def redeem_points(self, event: AstrMessageEvent, reason: str = "请处理兑换申请"):
         """达到兑换门槛后，创建兑换申请并提醒指定 QQ。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         sender_id = str(event.get_sender_id())
         sender_name = event.get_sender_name() or sender_id
         data = await self._load_data()
@@ -647,6 +813,11 @@ class PointsPlugin(Star):
     @filter.command("兑换状态")
     async def redeem_status(self, event: AstrMessageEvent, order_id: int = 0):
         """查询兑换审核状态。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         sender_id = str(event.get_sender_id())
         data = await self._load_data()
 
@@ -689,9 +860,191 @@ class PointsPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("群控状态")
+    async def admin_group_control_status(self, event: AstrMessageEvent):
+        """管理员查看群白名单/黑名单和当前群启用状态。"""
+        group_id = self._get_event_group_id(event)
+        whitelist = self._cfg_group_id_list("group_whitelist")
+        blacklist = self._cfg_group_id_list("group_blacklist")
+        private_enabled = self._cfg_bool("group_enable_private", True)
+        current_enabled = self._is_event_allowed(event)
+
+        lines = ["群控配置："]
+        if group_id:
+            lines.append(f"- 当前群：{group_id}")
+        else:
+            lines.append("- 当前会话：私聊")
+        lines.append(f"- 当前会话是否启用：{'是' if current_enabled else '否'}")
+        lines.append(f"- 私聊是否启用：{'是' if private_enabled else '否'}")
+        lines.append(f"- 白名单数量：{len(whitelist)}")
+        lines.append(f"- 黑名单数量：{len(blacklist)}")
+        if whitelist:
+            lines.append(f"- 白名单：{', '.join(whitelist[:20])}")
+        if blacklist:
+            lines.append(f"- 黑名单：{', '.join(blacklist[:20])}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("白名单加")
+    async def admin_group_whitelist_add(self, event: AstrMessageEvent, group_ids: str = ""):
+        """管理员添加一个或多个群到白名单（逗号分隔）。"""
+        targets = self._parse_id_text(group_ids, self._normalize_group_id)
+        if not targets:
+            target = self._resolve_target_group(event, "")
+            if target:
+                targets = [target]
+        if not targets:
+            yield event.plain_result("请提供群号（支持逗号分隔多个），或在群聊中直接执行。")
+            return
+
+        whitelist = self._cfg_group_id_list("group_whitelist")
+        added: list[str] = []
+        existed: list[str] = []
+        for target in targets:
+            if target in whitelist:
+                existed.append(target)
+                continue
+            whitelist.append(target)
+            added.append(target)
+
+        if not added:
+            yield event.plain_result(f"目标群已全部在白名单中：{', '.join(existed)}")
+            return
+
+        self._set_group_id_list("group_whitelist", whitelist)
+        msg = f"已加入白名单：{', '.join(added)}"
+        if existed:
+            msg += f"\n已存在：{', '.join(existed)}"
+        yield event.plain_result(msg)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("白名单删")
+    async def admin_group_whitelist_remove(self, event: AstrMessageEvent, group_ids: str = ""):
+        """管理员从白名单移除一个或多个群（逗号分隔）。"""
+        targets = self._parse_id_text(group_ids, self._normalize_group_id)
+        if not targets:
+            target = self._resolve_target_group(event, "")
+            if target:
+                targets = [target]
+        if not targets:
+            yield event.plain_result("请提供有效群号（支持逗号分隔多个），或在群聊中直接执行。")
+            return
+
+        whitelist = self._cfg_group_id_list("group_whitelist")
+        removed: list[str] = []
+        missing: list[str] = []
+        for target in targets:
+            if target in whitelist:
+                removed.append(target)
+            else:
+                missing.append(target)
+
+        if not removed:
+            yield event.plain_result(f"目标群均不在白名单中：{', '.join(missing)}")
+            return
+
+        whitelist = [gid for gid in whitelist if gid not in set(removed)]
+        self._set_group_id_list("group_whitelist", whitelist)
+        msg = f"已从白名单移除：{', '.join(removed)}"
+        if missing:
+            msg += f"\n原本不存在：{', '.join(missing)}"
+        yield event.plain_result(msg)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("白名单列表")
+    async def admin_group_whitelist_list(self, event: AstrMessageEvent):
+        """管理员查看白名单群列表。"""
+        whitelist = self._cfg_group_id_list("group_whitelist")
+        if not whitelist:
+            yield event.plain_result("白名单为空。")
+            return
+        yield event.plain_result("白名单群：\n" + "\n".join(whitelist))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("黑名单加")
+    async def admin_group_blacklist_add(self, event: AstrMessageEvent, group_ids: str = ""):
+        """管理员添加一个或多个群到黑名单（逗号分隔）。"""
+        targets = self._parse_id_text(group_ids, self._normalize_group_id)
+        if not targets:
+            target = self._resolve_target_group(event, "")
+            if target:
+                targets = [target]
+        if not targets:
+            yield event.plain_result("请提供群号（支持逗号分隔多个），或在群聊中直接执行。")
+            return
+
+        blacklist = self._cfg_group_id_list("group_blacklist")
+        added: list[str] = []
+        existed: list[str] = []
+        for target in targets:
+            if target in blacklist:
+                existed.append(target)
+                continue
+            blacklist.append(target)
+            added.append(target)
+
+        if not added:
+            yield event.plain_result(f"目标群已全部在黑名单中：{', '.join(existed)}")
+            return
+
+        self._set_group_id_list("group_blacklist", blacklist)
+        msg = f"已加入黑名单：{', '.join(added)}"
+        if existed:
+            msg += f"\n已存在：{', '.join(existed)}"
+        yield event.plain_result(msg)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("黑名单删")
+    async def admin_group_blacklist_remove(self, event: AstrMessageEvent, group_ids: str = ""):
+        """管理员从黑名单移除一个或多个群（逗号分隔）。"""
+        targets = self._parse_id_text(group_ids, self._normalize_group_id)
+        if not targets:
+            target = self._resolve_target_group(event, "")
+            if target:
+                targets = [target]
+        if not targets:
+            yield event.plain_result("请提供有效群号（支持逗号分隔多个），或在群聊中直接执行。")
+            return
+
+        blacklist = self._cfg_group_id_list("group_blacklist")
+        removed: list[str] = []
+        missing: list[str] = []
+        for target in targets:
+            if target in blacklist:
+                removed.append(target)
+            else:
+                missing.append(target)
+
+        if not removed:
+            yield event.plain_result(f"目标群均不在黑名单中：{', '.join(missing)}")
+            return
+
+        blacklist = [gid for gid in blacklist if gid not in set(removed)]
+        self._set_group_id_list("group_blacklist", blacklist)
+        msg = f"已从黑名单移除：{', '.join(removed)}"
+        if missing:
+            msg += f"\n原本不存在：{', '.join(missing)}"
+        yield event.plain_result(msg)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("黑名单列表")
+    async def admin_group_blacklist_list(self, event: AstrMessageEvent):
+        """管理员查看黑名单群列表。"""
+        blacklist = self._cfg_group_id_list("group_blacklist")
+        if not blacklist:
+            yield event.plain_result("黑名单为空。")
+            return
+        yield event.plain_result("黑名单群：\n" + "\n".join(blacklist))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("加分")
     async def admin_add_points(self, event: AstrMessageEvent, qq: str, points: int):
         """管理员给指定 QQ 增加积分。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         if points <= 0:
             yield event.plain_result("加分数值必须大于 0。")
             return
@@ -706,6 +1059,11 @@ class PointsPlugin(Star):
     @filter.command("扣分")
     async def admin_sub_points(self, event: AstrMessageEvent, qq: str, points: int):
         """管理员扣除指定 QQ 的积分。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         if points <= 0:
             yield event.plain_result("扣分数值必须大于 0。")
             return
@@ -720,6 +1078,11 @@ class PointsPlugin(Star):
     @filter.command("设置概率")
     async def admin_set_chance(self, event: AstrMessageEvent, chance_percent: int):
         """管理员设置聊天随机奖励概率。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         if chance_percent < 0 or chance_percent > 100:
             yield event.plain_result("概率范围必须在 0 到 100 之间。")
             return
@@ -733,6 +1096,11 @@ class PointsPlugin(Star):
     @filter.command("设置范围")
     async def admin_set_range(self, event: AstrMessageEvent, reward_min: int, reward_max: int):
         """管理员设置聊天随机奖励积分区间。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         if reward_min <= 0 or reward_max <= 0:
             yield event.plain_result("积分范围必须是正整数。")
             return
@@ -750,6 +1118,11 @@ class PointsPlugin(Star):
     @filter.command("设置奖项")
     async def admin_set_lottery_prize(self, event: AstrMessageEvent, level: int, points: int, chance_percent: int):
         """管理员设置抽奖奖项积分与概率。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         if level not in (1, 2, 3):
             yield event.plain_result("奖项等级只能是 1、2、3。")
             return
@@ -781,6 +1154,11 @@ class PointsPlugin(Star):
     @filter.command("设置抽奖消耗")
     async def admin_set_lottery_cost(self, event: AstrMessageEvent, cost_points: int):
         """管理员设置每次抽奖消耗积分。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         if cost_points <= 0:
             yield event.plain_result("抽奖消耗必须大于 0。")
             return
@@ -794,6 +1172,11 @@ class PointsPlugin(Star):
     @filter.command("设置兑换积分")
     async def admin_set_redeem_cost(self, event: AstrMessageEvent, cost_points: int):
         """管理员设置固定兑换所需积分。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         if cost_points <= 0:
             yield event.plain_result("兑换积分必须大于 0。")
             return
@@ -807,6 +1190,11 @@ class PointsPlugin(Star):
     @filter.command("设置兑换通知")
     async def admin_set_redeem_notify(self, event: AstrMessageEvent, notify_qq: str):
         """管理员设置兑换提醒 QQ。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         notify_qq = self._normalize_qq(notify_qq)
         if not notify_qq:
             yield event.plain_result("通知 QQ 无效，请输入纯QQ号或包含QQ号的文本。")
@@ -821,6 +1209,11 @@ class PointsPlugin(Star):
     @filter.command("设置保底")
     async def admin_set_lottery_pity(self, event: AstrMessageEvent, pity_threshold: int):
         """管理员设置抽奖保底阈值（连续未中奖次数）。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         if pity_threshold < 0:
             yield event.plain_result("保底阈值不能小于 0。")
             return
@@ -838,6 +1231,11 @@ class PointsPlugin(Star):
     @filter.command("兑换处理")
     async def admin_redeem_processing(self, event: AstrMessageEvent, order_id: int, note: str = ""):
         """管理员将兑换单标记为已处理。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         data = await self._load_data()
         order = self._find_redeem_order(data, order_id)
         if not order:
@@ -864,6 +1262,11 @@ class PointsPlugin(Star):
     @filter.command("兑换完成")
     async def admin_redeem_completed(self, event: AstrMessageEvent, order_id: int, note: str = ""):
         """管理员将兑换单标记为已完成。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         data = await self._load_data()
         order = self._find_redeem_order(data, order_id)
         if not order:
@@ -886,6 +1289,11 @@ class PointsPlugin(Star):
     @filter.command("兑换待处理")
     async def admin_redeem_pending(self, event: AstrMessageEvent, limit: int = 10):
         """管理员查看待处理兑换单（状态：已申请）。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         if limit <= 0:
             limit = 10
         limit = min(limit, 50)
@@ -914,6 +1322,11 @@ class PointsPlugin(Star):
     @filter.command("设置")
     async def show_settings(self, event: AstrMessageEvent):
         """查看当前随机奖励配置。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
         data = await self._load_data()
         chance, reward_min, reward_max = self._get_reward_settings(data)
         cooldown = self._cfg_int("chat_reward_cooldown_seconds", 30, 0, 86400)
@@ -945,6 +1358,9 @@ class PointsPlugin(Star):
     @filter.command("看板地址")
     async def show_dashboard_url(self, event: AstrMessageEvent):
         """管理员查看本地积分看板地址。"""
+        if self._dashboard_runner is None:
+            await self._start_dashboard_server()
+
         token = self._cfg_str("dashboard_token", "").strip()
         if self._dashboard_url:
             if token:
@@ -957,6 +1373,27 @@ class PointsPlugin(Star):
 
         if self._dashboard_error:
             yield event.plain_result(f"积分看板未启动：{self._dashboard_error}")
+            return
+
+        yield event.plain_result("积分看板未启用，请检查 dashboard_enabled 配置。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("重启看板")
+    async def restart_dashboard(self, event: AstrMessageEvent):
+        """管理员重启本地积分看板服务。"""
+        await self._stop_dashboard_server()
+        await self._start_dashboard_server()
+
+        token = self._cfg_str("dashboard_token", "").strip()
+        if self._dashboard_url:
+            if token:
+                yield event.plain_result(f"积分看板已重启：{self._dashboard_url}/?token={token}")
+                return
+            yield event.plain_result(f"积分看板已重启：{self._dashboard_url}")
+            return
+
+        if self._dashboard_error:
+            yield event.plain_result(f"积分看板重启失败：{self._dashboard_error}")
             return
 
         yield event.plain_result("积分看板未启用，请检查 dashboard_enabled 配置。")
