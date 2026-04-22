@@ -141,7 +141,7 @@
     "description": "看板端口",
     "hint": "按你的需求默认 6666。若浏览器拦截可改为 16666。",
     "type": "int",
-    "default": 6666,
+    "default": 16666,
     "obvious_hint": true
   },
   "dashboard_title": {

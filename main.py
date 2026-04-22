@@ -324,7 +324,7 @@ class PointsPlugin(Star):
             return
 
         host = self._cfg_str("dashboard_host", "127.0.0.1").strip() or "127.0.0.1"
-        port = self._cfg_int("dashboard_port", 6666, 1, 65535)
+        port = self._cfg_int("dashboard_port", 16666, 1, 65535)
 
         app = web.Application()
         app.router.add_get("/", self._dashboard_index)
