@@ -100,30 +100,6 @@
     "type": "string",
     "default": ""
   },
-  "webui_snapshot_max_lines": {
-    "description": "WebUI看板最多显示记录条数",
-    "hint": "同时影响积分看板和兑换记录看板，建议 100-1000。",
-    "type": "int",
-    "default": 300
-  },
-  "webui_points_snapshot": {
-    "description": "WebUI 积分看板（自动生成）",
-    "hint": "只读展示。插件会自动刷新，不建议手动编辑。",
-    "obvious_hint": true,
-    "type": "text",
-    "default": "",
-    "editor_mode": true,
-    "editor_language": "markdown"
-  },
-  "webui_redeem_snapshot": {
-    "description": "WebUI 兑换记录看板（自动生成）",
-    "hint": "只读展示。插件会自动刷新，不建议手动编辑。",
-    "obvious_hint": true,
-    "type": "text",
-    "default": "",
-    "editor_mode": true,
-    "editor_language": "markdown"
-  },
   "dashboard_enabled": {
     "description": "启用本地积分看板网站",
     "hint": "启用后可直接通过浏览器访问本地端口查看积分与兑换记录。",
@@ -139,7 +115,7 @@
   },
   "dashboard_port": {
     "description": "看板端口",
-    "hint": "按你的需求默认 6666。若浏览器拦截可改为 16666。",
+    "hint": "默认 16666，可按需修改。",
     "type": "int",
     "default": 16666,
     "obvious_hint": true

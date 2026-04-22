@@ -29,8 +29,6 @@ class PointsPlugin(Star):
 
     async def initialize(self):
         """插件初始化时自动调用。"""
-        data = await self._load_data()
-        self._refresh_webui_snapshot(data)
         await self._start_dashboard_server()
 
     @staticmethod
@@ -233,84 +231,6 @@ class PointsPlugin(Star):
             if self._to_int(item.get("id", 0), 0) == order_id:
                 return item
         return None
-
-    def _refresh_webui_snapshot(self, data: dict[str, Any]) -> None:
-        max_lines = self._cfg_int("webui_snapshot_max_lines", 300, 50, 5000)
-
-        users: list[tuple[str, str, int, int]] = []
-        for uid, item in data["users"].items():
-            if not isinstance(item, dict):
-                continue
-            users.append(
-                (
-                    str(uid),
-                    str(item.get("name") or uid),
-                    self._to_int(item.get("points", 0), 0),
-                    self._to_int(item.get("sign_streak", 0), 0),
-                )
-            )
-        users.sort(key=lambda x: (-x[2], x[0]))
-
-        points_lines = [
-            "# 积分看板",
-            f"更新时间: {self._now_str()}",
-            f"总用户数: {len(users)}",
-            "",
-            "排名 | 用户 | QQ | 积分 | 连签",
-            "---|---|---|---|---",
-        ]
-        for idx, (uid, name, points, streak) in enumerate(users[:max_lines], start=1):
-            points_lines.append(f"{idx} | {name} | {uid} | {points} | {streak}")
-        if len(users) > max_lines:
-            points_lines.append("")
-            points_lines.append(f"仅显示前 {max_lines} 条，其余请调整 webui_snapshot_max_lines。")
-
-        status_counts = {"已申请": 0, "已处理": 0, "已完成": 0}
-        records: list[dict[str, Any]] = []
-        for item in data["redeems"]:
-            if not isinstance(item, dict):
-                continue
-            status = str(item.get("status", ""))
-            if status in status_counts:
-                status_counts[status] += 1
-            records.append(item)
-
-        records.sort(key=lambda x: self._to_int(x.get("id", 0), 0), reverse=True)
-        redeem_lines = [
-            "# 兑换记录看板",
-            f"更新时间: {self._now_str()}",
-            f"总记录数: {len(records)}",
-            f"已申请: {status_counts['已申请']} | 已处理: {status_counts['已处理']} | 已完成: {status_counts['已完成']}",
-            "",
-            "单号 | 状态 | 用户 | QQ | 积分 | 说明 | 更新时间 | 处理人",
-            "---|---|---|---|---|---|---|---",
-        ]
-        for item in records[:max_lines]:
-            order_id = self._to_int(item.get("id", 0), 0)
-            status = str(item.get("status", "未知"))
-            user_name = str(item.get("user_name", ""))
-            user_id = str(item.get("user_id", ""))
-            cost = self._to_int(item.get("cost", 0), 0)
-            reason = str(item.get("reason", "")).replace("\n", " ")[:50]
-            updated_at = str(item.get("updated_at", ""))
-            handler_name = str(item.get("handler_name", ""))
-            redeem_lines.append(
-                f"{order_id} | {status} | {user_name} | {user_id} | {cost} | {reason} | {updated_at} | {handler_name}"
-            )
-        if len(records) > max_lines:
-            redeem_lines.append("")
-            redeem_lines.append(f"仅显示最近 {max_lines} 条，其余请调整 webui_snapshot_max_lines。")
-
-        if isinstance(self.config, dict):
-            self.config["webui_points_snapshot"] = "\n".join(points_lines)
-            self.config["webui_redeem_snapshot"] = "\n".join(redeem_lines)
-
-        save_fn = getattr(self.config, "save_config", None)
-        if callable(save_fn):
-            try:
-                save_fn()
-            except Exception as exc:
-                logger.warning(f"刷新 WebUI 看板失败: {exc}")
 
     async def _start_dashboard_server(self) -> None:
         if not self._cfg_bool("dashboard_enabled", True):
@@ -515,7 +435,6 @@ class PointsPlugin(Star):
         gained = random.randint(reward_min, reward_max)
         self._change_points(user, gained)
         await self._save_data(data)
-        self._refresh_webui_snapshot(data)
         yield event.plain_result(
             f"随机奖励触发，{sender_name} 获得 {gained} 积分，当前积分 {user['points']}。"
         )
@@ -555,7 +474,6 @@ class PointsPlugin(Star):
         user["last_sign_date"] = today
         user["sign_streak"] = streak
         await self._save_data(data)
-        self._refresh_webui_snapshot(data)
         yield event.plain_result(
             f"签到成功，{sender_name} 连续签到 {streak} 天，"
             f"基础 {base_points} + 连签加成 {extra_bonus} = {sign_points} 积分，当前积分 {user['points']}。"
@@ -666,7 +584,6 @@ class PointsPlugin(Star):
 
         self._change_points(sender_user, reward_total)
         await self._save_data(data)
-        self._refresh_webui_snapshot(data)
 
         pity_text = "保底已关闭"
         if pity_threshold > 0:
@@ -715,7 +632,6 @@ class PointsPlugin(Star):
             data["redeems"] = data["redeems"][-1000:]
 
         await self._save_data(data)
-        self._refresh_webui_snapshot(data)
 
         notify_text = (
             f"兑换申请 #{order_id}（状态：已申请）：{sender_name}({sender_id})"
@@ -784,7 +700,6 @@ class PointsPlugin(Star):
         user = self._ensure_user(data, qq)
         self._change_points(user, points)
         await self._save_data(data)
-        self._refresh_webui_snapshot(data)
         yield event.plain_result(f"已为 {qq} 增加 {points} 积分，当前 {user['points']}。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -799,7 +714,6 @@ class PointsPlugin(Star):
         user = self._ensure_user(data, qq)
         self._change_points(user, -points)
         await self._save_data(data)
-        self._refresh_webui_snapshot(data)
         yield event.plain_result(f"已扣除 {qq} {points} 积分，当前 {user['points']}。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -944,7 +858,6 @@ class PointsPlugin(Star):
             order["note"] = note
 
         await self._save_data(data)
-        self._refresh_webui_snapshot(data)
         yield event.plain_result(f"兑换单 #{order_id} 状态已更新为 已处理。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -967,7 +880,6 @@ class PointsPlugin(Star):
             order["note"] = note
 
         await self._save_data(data)
-        self._refresh_webui_snapshot(data)
         yield event.plain_result(f"兑换单 #{order_id} 状态已更新为 已完成。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1028,14 +940,6 @@ class PointsPlugin(Star):
             f"- 固定兑换积分：{redeem_cost}\n"
             f"- 兑换通知 QQ：{redeem_notify_qq or '未设置'}"
         )
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("刷新看板")
-    async def refresh_webui_board(self, event: AstrMessageEvent):
-        """管理员手动刷新 WebUI 看板数据。"""
-        data = await self._load_data()
-        self._refresh_webui_snapshot(data)
-        yield event.plain_result("WebUI 看板已刷新，请在插件配置页查看积分与兑换记录。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("看板地址")
