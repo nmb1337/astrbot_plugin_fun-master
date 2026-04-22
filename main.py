@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+from html import escape
 import random
 import re
 import time
@@ -9,6 +10,11 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
+try:
+    from aiohttp import web
+except ImportError:
+    web = None
+
 
 @register("astrbot_plugin_fun", "Copilot", "聊天积分玩法插件", "1.0.0")
 class PointsPlugin(Star):
@@ -17,11 +23,15 @@ class PointsPlugin(Star):
     def __init__(self, context: Context, config: Any = None):
         super().__init__(context)
         self.config = config or {}
+        self._dashboard_runner = None
+        self._dashboard_url = ""
+        self._dashboard_error = ""
 
     async def initialize(self):
         """插件初始化时自动调用。"""
         data = await self._load_data()
         self._refresh_webui_snapshot(data)
+        await self._start_dashboard_server()
 
     @staticmethod
     def _to_int(value: Any, default: int) -> int:
@@ -47,6 +57,19 @@ class PointsPlugin(Star):
                 return default
             return str(value)
         return default
+
+    def _cfg_bool(self, key: str, default: bool) -> bool:
+        value = default
+        if isinstance(self.config, dict):
+            value = self.config.get(key, default)
+
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "y"}
+        return bool(value)
 
     async def _load_data(self) -> dict[str, Any]:
         data = await self.get_kv_data(self.DATA_KEY, {})
@@ -288,6 +311,153 @@ class PointsPlugin(Star):
                 save_fn()
             except Exception as exc:
                 logger.warning(f"刷新 WebUI 看板失败: {exc}")
+
+    async def _start_dashboard_server(self) -> None:
+        if not self._cfg_bool("dashboard_enabled", True):
+            self._dashboard_url = ""
+            self._dashboard_error = ""
+            return
+
+        if web is None:
+            self._dashboard_error = "未安装 aiohttp，无法启动积分看板。"
+            logger.warning(self._dashboard_error)
+            return
+
+        host = self._cfg_str("dashboard_host", "127.0.0.1").strip() or "127.0.0.1"
+        port = self._cfg_int("dashboard_port", 6666, 1, 65535)
+
+        app = web.Application()
+        app.router.add_get("/", self._dashboard_index)
+        app.router.add_get("/healthz", self._dashboard_health)
+
+        runner = web.AppRunner(app)
+        try:
+            await runner.setup()
+            site = web.TCPSite(runner, host=host, port=port)
+            await site.start()
+            self._dashboard_runner = runner
+            self._dashboard_url = f"http://{host}:{port}"
+            self._dashboard_error = ""
+            logger.info(f"积分看板已启动: {self._dashboard_url}")
+        except Exception as exc:
+            self._dashboard_error = f"启动积分看板失败: {exc}"
+            self._dashboard_url = ""
+            logger.warning(self._dashboard_error)
+            try:
+                await runner.cleanup()
+            except Exception:
+                pass
+
+    async def _stop_dashboard_server(self) -> None:
+        if self._dashboard_runner is None:
+            return
+        try:
+            await self._dashboard_runner.cleanup()
+        except Exception as exc:
+            logger.warning(f"关闭积分看板失败: {exc}")
+        finally:
+            self._dashboard_runner = None
+            self._dashboard_url = ""
+
+    async def _dashboard_health(self, request):
+        return web.json_response({"ok": True, "name": "astrbot_plugin_fun_dashboard"})
+
+    async def _dashboard_index(self, request):
+        token = self._cfg_str("dashboard_token", "").strip()
+        if token and request.query.get("token", "") != token:
+            return web.Response(status=401, text="Unauthorized")
+
+        data = await self._load_data()
+        html_text = self._build_dashboard_html(data)
+        return web.Response(text=html_text, content_type="text/html")
+
+    def _build_dashboard_html(self, data: dict[str, Any]) -> str:
+        title = escape(self._cfg_str("dashboard_title", "积分看板"))
+        refresh_seconds = self._cfg_int("dashboard_auto_refresh_seconds", 15, 0, 3600)
+        refresh_meta = ""
+        if refresh_seconds > 0:
+            refresh_meta = f'<meta http-equiv="refresh" content="{refresh_seconds}">'
+
+        users: list[tuple[str, str, int, int]] = []
+        for uid, item in data["users"].items():
+            if not isinstance(item, dict):
+                continue
+            users.append(
+                (
+                    str(uid),
+                    str(item.get("name") or uid),
+                    self._to_int(item.get("points", 0), 0),
+                    self._to_int(item.get("sign_streak", 0), 0),
+                )
+            )
+        users.sort(key=lambda x: (-x[2], x[0]))
+
+        points_rows = []
+        for idx, (uid, name, points, streak) in enumerate(users, start=1):
+            points_rows.append(
+                "<tr>"
+                f"<td>{idx}</td><td>{escape(name)}</td><td>{escape(uid)}</td><td>{points}</td><td>{streak}</td>"
+                "</tr>"
+            )
+        if not points_rows:
+            points_rows.append('<tr><td colspan="5">暂无积分数据</td></tr>')
+
+        status_counts = {"已申请": 0, "已处理": 0, "已完成": 0}
+        records: list[dict[str, Any]] = []
+        for item in data["redeems"]:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status", ""))
+            if status in status_counts:
+                status_counts[status] += 1
+            records.append(item)
+        records.sort(key=lambda x: self._to_int(x.get("id", 0), 0), reverse=True)
+
+        redeem_rows = []
+        for item in records:
+            order_id = self._to_int(item.get("id", 0), 0)
+            status = escape(str(item.get("status", "未知")))
+            user_name = escape(str(item.get("user_name", "")))
+            user_id = escape(str(item.get("user_id", "")))
+            cost = self._to_int(item.get("cost", 0), 0)
+            reason = escape(str(item.get("reason", "")).replace("\n", " "))
+            updated_at = escape(str(item.get("updated_at", "")))
+            handler_name = escape(str(item.get("handler_name", "")))
+            redeem_rows.append(
+                "<tr>"
+                f"<td>{order_id}</td><td>{status}</td><td>{user_name}</td><td>{user_id}</td>"
+                f"<td>{cost}</td><td>{reason}</td><td>{updated_at}</td><td>{handler_name}</td>"
+                "</tr>"
+            )
+        if not redeem_rows:
+            redeem_rows.append('<tr><td colspan="8">暂无兑换记录</td></tr>')
+
+        return (
+            "<!doctype html><html><head><meta charset=\"utf-8\">"
+            f"{refresh_meta}"
+            f"<title>{title}</title>"
+            "<style>"
+            "body{font-family:Segoe UI,Microsoft YaHei,sans-serif;background:#f5f7fb;color:#1f2937;padding:20px;}"
+            ".card{background:#fff;border-radius:12px;padding:16px;margin-bottom:16px;box-shadow:0 4px 14px rgba(0,0,0,.05);}"
+            "h1{margin:0 0 10px;font-size:28px;}"
+            "h2{margin:8px 0 12px;font-size:20px;}"
+            "table{width:100%;border-collapse:collapse;font-size:14px;}"
+            "th,td{border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;vertical-align:top;}"
+            "th{background:#f3f4f6;}"
+            ".meta{color:#4b5563;font-size:13px;margin:8px 0;}"
+            "</style></head><body>"
+            f"<div class=\"card\"><h1>{title}</h1>"
+            f"<div class=\"meta\">更新时间：{escape(self._now_str())} | 用户数：{len(users)} | 兑换单：{len(records)}</div>"
+            f"<div class=\"meta\">状态统计：已申请 {status_counts['已申请']}，已处理 {status_counts['已处理']}，已完成 {status_counts['已完成']}</div>"
+            "</div>"
+            "<div class=\"card\"><h2>每个人的积分</h2>"
+            "<table><thead><tr><th>排名</th><th>昵称</th><th>QQ</th><th>积分</th><th>连签</th></tr></thead>"
+            f"<tbody>{''.join(points_rows)}</tbody></table></div>"
+            "<div class=\"card\"><h2>兑换申请与记录</h2>"
+            "<table><thead><tr><th>单号</th><th>状态</th><th>申请人</th><th>QQ</th><th>积分</th><th>说明</th><th>更新时间</th><th>处理人</th></tr></thead>"
+            f"<tbody>{''.join(redeem_rows)}</tbody></table></div>"
+            "</body></html>"
+        )
 
     @staticmethod
     def _normalize_qq(value: str) -> str:
@@ -867,5 +1037,26 @@ class PointsPlugin(Star):
         self._refresh_webui_snapshot(data)
         yield event.plain_result("WebUI 看板已刷新，请在插件配置页查看积分与兑换记录。")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("看板地址")
+    async def show_dashboard_url(self, event: AstrMessageEvent):
+        """管理员查看本地积分看板地址。"""
+        token = self._cfg_str("dashboard_token", "").strip()
+        if self._dashboard_url:
+            if token:
+                yield event.plain_result(
+                    f"积分看板地址：{self._dashboard_url}/?token={token}"
+                )
+                return
+            yield event.plain_result(f"积分看板地址：{self._dashboard_url}")
+            return
+
+        if self._dashboard_error:
+            yield event.plain_result(f"积分看板未启动：{self._dashboard_error}")
+            return
+
+        yield event.plain_result("积分看板未启用，请检查 dashboard_enabled 配置。")
+
     async def terminate(self):
         """插件被卸载/停用时调用。"""
+        await self._stop_dashboard_server()

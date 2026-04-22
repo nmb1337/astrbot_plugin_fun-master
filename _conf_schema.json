@@ -124,6 +124,43 @@
     "editor_mode": true,
     "editor_language": "markdown"
   },
+  "dashboard_enabled": {
+    "description": "启用本地积分看板网站",
+    "hint": "启用后可直接通过浏览器访问本地端口查看积分与兑换记录。",
+    "type": "bool",
+    "default": true,
+    "obvious_hint": true
+  },
+  "dashboard_host": {
+    "description": "看板监听地址",
+    "hint": "默认 127.0.0.1，仅本机可访问。若需局域网访问可改为 0.0.0.0。",
+    "type": "string",
+    "default": "127.0.0.1"
+  },
+  "dashboard_port": {
+    "description": "看板端口",
+    "hint": "按你的需求默认 6666。若浏览器拦截可改为 16666。",
+    "type": "int",
+    "default": 6666,
+    "obvious_hint": true
+  },
+  "dashboard_title": {
+    "description": "看板网页标题",
+    "type": "string",
+    "default": "积分看板"
+  },
+  "dashboard_auto_refresh_seconds": {
+    "description": "网页自动刷新秒数",
+    "hint": "0 表示关闭自动刷新。",
+    "type": "int",
+    "default": 15
+  },
+  "dashboard_token": {
+    "description": "看板访问口令（可选）",
+    "hint": "留空表示无需口令。填写后需要通过 ?token=口令 访问。",
+    "type": "string",
+    "default": ""
+  },
   "leaderboard_default_size": {
     "description": "排行榜默认展示人数",
     "hint": "建议 5-20。",
