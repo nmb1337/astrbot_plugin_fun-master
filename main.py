@@ -20,6 +20,8 @@ except ImportError:
 @register("astrbot_plugin_fun", "Copilot", "聊天积分玩法插件", "1.0.0")
 class PointsPlugin(Star):
     DATA_KEY = "points_data_v1"
+    SPEECH_DAILY_RETENTION_DAYS = 62
+    SPEECH_MONTHLY_RETENTION_MONTHS = 18
 
     def __init__(self, context: Context, config: Any = None):
         super().__init__(context)
@@ -127,19 +129,24 @@ class PointsPlugin(Star):
         group_id = getattr(message_obj, "group_id", "")
         return str(group_id or "").strip()
 
+    def _is_group_allowed_by_policy(self, group_id: str) -> bool:
+        gid = self._normalize_group_id(group_id)
+        if not gid:
+            return False
+
+        whitelist = set(self._cfg_group_id_list("group_whitelist"))
+        blacklist = set(self._cfg_group_id_list("group_blacklist"))
+        if gid in blacklist:
+            return False
+        if whitelist and gid not in whitelist:
+            return False
+        return True
+
     def _is_event_allowed(self, event: AstrMessageEvent) -> bool:
         group_id = self._get_event_group_id(event)
         if not group_id:
             return self._cfg_bool("group_enable_private", True)
-
-        whitelist = set(self._cfg_group_id_list("group_whitelist"))
-        blacklist = set(self._cfg_group_id_list("group_blacklist"))
-
-        if group_id in blacklist:
-            return False
-        if whitelist and group_id not in whitelist:
-            return False
-        return True
+        return self._is_group_allowed_by_policy(group_id)
 
     def _blocked_result(self, event: AstrMessageEvent):
         if self._is_event_allowed(event):
@@ -212,6 +219,8 @@ class PointsPlugin(Star):
         chat_ts = data.get("chat_ts", {})
         redeems = data.get("redeems", [])
         redeem_seq = self._to_int(data.get("redeem_seq", 0), 0)
+        speech_daily = data.get("speech_daily", {})
+        speech_monthly = data.get("speech_monthly", {})
         if not isinstance(users, dict):
             users = {}
         if not isinstance(settings, dict):
@@ -220,6 +229,10 @@ class PointsPlugin(Star):
             chat_ts = {}
         if not isinstance(redeems, list):
             redeems = []
+        if not isinstance(speech_daily, dict):
+            speech_daily = {}
+        if not isinstance(speech_monthly, dict):
+            speech_monthly = {}
 
         return {
             "users": users,
@@ -227,6 +240,8 @@ class PointsPlugin(Star):
             "chat_ts": chat_ts,
             "redeems": redeems,
             "redeem_seq": max(0, redeem_seq),
+            "speech_daily": speech_daily,
+            "speech_monthly": speech_monthly,
         }
 
     async def _save_data(self, data: dict[str, Any]) -> None:
@@ -258,6 +273,117 @@ class PointsPlugin(Star):
     @staticmethod
     def _change_points(user: dict[str, Any], delta: int) -> None:
         user["points"] = max(0, int(user.get("points", 0)) + delta)
+
+    @staticmethod
+    def _month_index(month_key: str) -> int | None:
+        text = str(month_key or "").strip()
+        if not re.match(r"^\d{4}-\d{2}$", text):
+            return None
+        year = int(text[:4])
+        month = int(text[5:7])
+        if month < 1 or month > 12:
+            return None
+        return year * 12 + month
+
+    def _prune_speech_stats(self, data: dict[str, Any]) -> None:
+        speech_daily = data.get("speech_daily")
+        speech_monthly = data.get("speech_monthly")
+        if not isinstance(speech_daily, dict):
+            data["speech_daily"] = {}
+            speech_daily = data["speech_daily"]
+        if not isinstance(speech_monthly, dict):
+            data["speech_monthly"] = {}
+            speech_monthly = data["speech_monthly"]
+
+        today = date.today()
+        daily_cutoff = (today - timedelta(days=self.SPEECH_DAILY_RETENTION_DAYS)).isoformat()
+        for day_key in list(speech_daily.keys()):
+            valid = isinstance(day_key, str) and day_key >= daily_cutoff and isinstance(speech_daily.get(day_key), dict)
+            if not valid:
+                speech_daily.pop(day_key, None)
+
+        current_month_idx = today.year * 12 + today.month
+        month_cutoff = current_month_idx - self.SPEECH_MONTHLY_RETENTION_MONTHS
+        for month_key in list(speech_monthly.keys()):
+            idx = self._month_index(str(month_key))
+            valid = idx is not None and idx >= month_cutoff and isinstance(speech_monthly.get(month_key), dict)
+            if not valid:
+                speech_monthly.pop(month_key, None)
+
+    def _increment_speech_count(
+        self,
+        container: dict[str, Any],
+        period_key: str,
+        group_id: str,
+        user_id: str,
+        user_name: str,
+    ) -> None:
+        period_data = container.get(period_key)
+        if not isinstance(period_data, dict):
+            period_data = {}
+            container[period_key] = period_data
+
+        group_data = period_data.get(group_id)
+        if not isinstance(group_data, dict):
+            group_data = {}
+            period_data[group_id] = group_data
+
+        user_data = group_data.get(user_id)
+        if not isinstance(user_data, dict):
+            user_data = {"count": 0, "name": user_name or user_id}
+            group_data[user_id] = user_data
+
+        user_data["count"] = max(0, self._to_int(user_data.get("count", 0), 0)) + 1
+        user_data["name"] = user_name or user_id
+
+    def _record_group_speech_stat(self, data: dict[str, Any], event: AstrMessageEvent, sender_name: str) -> bool:
+        group_id = self._get_event_group_id(event)
+        if not group_id:
+            return False
+        if not self._is_group_allowed_by_policy(group_id):
+            return False
+
+        sender_id = str(event.get_sender_id() or "").strip()
+        if not sender_id:
+            return False
+
+        self_id = str(event.get_self_id() or "").strip()
+        if self_id and sender_id == self_id:
+            return False
+
+        self._prune_speech_stats(data)
+        today_key = date.today().isoformat()
+        month_key = today_key[:7]
+        self._increment_speech_count(data["speech_daily"], today_key, group_id, sender_id, sender_name)
+        self._increment_speech_count(data["speech_monthly"], month_key, group_id, sender_id, sender_name)
+        return True
+
+    def _flatten_speech_rows(self, period_data: Any) -> list[tuple[str, str, str, int]]:
+        rows: list[tuple[str, str, str, int]] = []
+        if not isinstance(period_data, dict):
+            return rows
+
+        for group_id, group_users in period_data.items():
+            if not isinstance(group_users, dict):
+                continue
+            if not self._is_group_allowed_by_policy(str(group_id)):
+                continue
+
+            for user_id, user_data in group_users.items():
+                uid = str(user_id)
+                if isinstance(user_data, dict):
+                    count = max(0, self._to_int(user_data.get("count", 0), 0))
+                    name = str(user_data.get("name") or uid)
+                else:
+                    count = max(0, self._to_int(user_data, 0))
+                    name = uid
+
+                if count <= 0:
+                    continue
+                rows.append((str(group_id), name, uid, count))
+
+        rows.sort(key=lambda x: (-x[3], x[0], x[2]))
+        return rows
 
     def _get_reward_settings(self, data: dict[str, Any]) -> tuple[int, int, int]:
         settings = data["settings"]
@@ -490,6 +616,19 @@ class PointsPlugin(Star):
         if refresh_seconds > 0:
             refresh_meta = f'<meta http-equiv="refresh" content="{refresh_seconds}">'
 
+        today_key = date.today().isoformat()
+        month_key = today_key[:7]
+        speech_daily = data.get("speech_daily", {})
+        speech_monthly = data.get("speech_monthly", {})
+        daily_rows_data = self._flatten_speech_rows(
+            speech_daily.get(today_key, {}) if isinstance(speech_daily, dict) else {}
+        )
+        monthly_rows_data = self._flatten_speech_rows(
+            speech_monthly.get(month_key, {}) if isinstance(speech_monthly, dict) else {}
+        )
+        daily_total = sum(row[3] for row in daily_rows_data)
+        monthly_total = sum(row[3] for row in monthly_rows_data)
+
         users: list[tuple[str, str, int, int]] = []
         for uid, item in data["users"].items():
             if not isinstance(item, dict):
@@ -513,6 +652,26 @@ class PointsPlugin(Star):
             )
         if not points_rows:
             points_rows.append('<tr><td colspan="5">暂无积分数据</td></tr>')
+
+        speech_daily_rows = []
+        for idx, (group_id, name, uid, count) in enumerate(daily_rows_data[:200], start=1):
+            speech_daily_rows.append(
+                "<tr>"
+                f"<td>{idx}</td><td>{escape(group_id)}</td><td>{escape(name)}</td><td>{escape(uid)}</td><td>{count}</td>"
+                "</tr>"
+            )
+        if not speech_daily_rows:
+            speech_daily_rows.append('<tr><td colspan="5">今日暂无发言数据</td></tr>')
+
+        speech_monthly_rows = []
+        for idx, (group_id, name, uid, count) in enumerate(monthly_rows_data[:200], start=1):
+            speech_monthly_rows.append(
+                "<tr>"
+                f"<td>{idx}</td><td>{escape(group_id)}</td><td>{escape(name)}</td><td>{escape(uid)}</td><td>{count}</td>"
+                "</tr>"
+            )
+        if not speech_monthly_rows:
+            speech_monthly_rows.append('<tr><td colspan="5">本月暂无发言数据</td></tr>')
 
         status_counts = {"已申请": 0, "已处理": 0, "已完成": 0}
         records: list[dict[str, Any]] = []
@@ -590,6 +749,14 @@ class PointsPlugin(Star):
             "<div class=\"card\"><h2>每个人的积分</h2>"
             "<table><thead><tr><th>排名</th><th>昵称</th><th>QQ</th><th>积分</th><th>连签</th></tr></thead>"
             f"<tbody>{''.join(points_rows)}</tbody></table></div>"
+            f"<div class=\"card\"><h2>群成员每日发言统计（{escape(today_key)}）</h2>"
+            f"<div class=\"meta\">当日总发言：{daily_total} 条，展示前 200 名</div>"
+            "<table><thead><tr><th>排名</th><th>群号</th><th>昵称</th><th>QQ</th><th>发言次数</th></tr></thead>"
+            f"<tbody>{''.join(speech_daily_rows)}</tbody></table></div>"
+            f"<div class=\"card\"><h2>群成员每月发言统计（{escape(month_key)}）</h2>"
+            f"<div class=\"meta\">当月总发言：{monthly_total} 条，展示前 200 名</div>"
+            "<table><thead><tr><th>排名</th><th>群号</th><th>昵称</th><th>QQ</th><th>发言次数</th></tr></thead>"
+            f"<tbody>{''.join(speech_monthly_rows)}</tbody></table></div>"
             "<div class=\"card\"><h2>兑换申请与记录</h2>"
             "<table><thead><tr><th>单号</th><th>状态</th><th>申请人</th><th>QQ</th><th>积分</th><th>说明</th><th>更新时间</th><th>处理人</th><th>操作</th></tr></thead>"
             f"<tbody>{''.join(redeem_rows)}</tbody></table></div>"
@@ -640,20 +807,35 @@ class PointsPlugin(Star):
         if not self._is_event_allowed(event):
             return
 
-        if not self._is_message_to_bot(event):
-            return
-
         message_str = (event.message_str or "").strip()
-        if not message_str:
-            return
-        if message_str.startswith("/"):
+        if not message_str and not self._extract_message_components(event):
             return
 
         sender_id = str(event.get_sender_id())
         sender_name = event.get_sender_name() or sender_id
 
-        data = await self._load_data()
-        user = self._ensure_user(data, sender_id, sender_name)
+        data: dict[str, Any] | None = None
+        user: dict[str, Any] | None = None
+        speech_changed = False
+
+        if self._get_event_group_id(event):
+            data = await self._load_data()
+            user = self._ensure_user(data, sender_id, sender_name)
+            speech_changed = self._record_group_speech_stat(data, event, sender_name)
+
+        if not self._is_message_to_bot(event):
+            if speech_changed and data is not None:
+                await self._save_data(data)
+            return
+
+        if message_str.startswith("/"):
+            if speech_changed and data is not None:
+                await self._save_data(data)
+            return
+
+        if data is None or user is None:
+            data = await self._load_data()
+            user = self._ensure_user(data, sender_id, sender_name)
         cooldown = self._cfg_int("chat_reward_cooldown_seconds", 30, 0, 86400)
 
         now = time.time()
