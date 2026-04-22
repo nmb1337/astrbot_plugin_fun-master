@@ -873,11 +873,15 @@ class PointsPlugin(Star):
         sender_id = str(event.get_sender_id())
         sender_name = event.get_sender_name() or sender_id
         today = date.today().isoformat()
+        tomorrow = (date.today() + timedelta(days=1)).isoformat()
 
         data = await self._load_data()
         user = self._ensure_user(data, sender_id, sender_name)
         if user.get("last_sign_date") == today:
-            yield event.plain_result(f"{sender_name} 今天已经签过到了，当前积分 {user['points']}。")
+            yield event.plain_result(
+                f"{sender_name} 今天已经签过到了（每日仅可签到一次），当前积分 {user['points']}。\n"
+                f"请在 {tomorrow} 再来签到。"
+            )
             return
 
         streak = 1
