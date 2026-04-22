@@ -4,10 +4,11 @@ import random
 import re
 import time
 from typing import Any
+from urllib.parse import urlencode
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
 try:
@@ -364,6 +365,30 @@ class PointsPlugin(Star):
                 return item
         return None
 
+    def _get_dashboard_token(self) -> str:
+        return self._cfg_str("dashboard_token", "").strip()
+
+    def _is_dashboard_authorized(self, request, payload: dict[str, Any] | None = None) -> bool:
+        token = self._get_dashboard_token()
+        if not token:
+            return True
+        req_token = str(request.query.get("token", "")).strip()
+        if not req_token and payload is not None:
+            req_token = str(payload.get("token", "")).strip()
+        return req_token == token
+
+    def _dashboard_redirect(self, message: str = ""):
+        params: list[tuple[str, str]] = []
+        token = self._get_dashboard_token()
+        if token:
+            params.append(("token", token))
+        if message:
+            params.append(("msg", message))
+        location = "/"
+        if params:
+            location = f"/?{urlencode(params)}"
+        raise web.HTTPFound(location)
+
     async def _start_dashboard_server(self) -> None:
         if self._dashboard_runner is not None:
             return
@@ -384,6 +409,7 @@ class PointsPlugin(Star):
         app = web.Application()
         app.router.add_get("/", self._dashboard_index)
         app.router.add_get("/healthz", self._dashboard_health)
+        app.router.add_post("/redeem/approve", self._dashboard_redeem_approve)
 
         runner = web.AppRunner(app)
         try:
@@ -417,18 +443,49 @@ class PointsPlugin(Star):
     async def _dashboard_health(self, request):
         return web.json_response({"ok": True, "name": "astrbot_plugin_fun_dashboard"})
 
+    async def _dashboard_redeem_approve(self, request):
+        post_data = await request.post()
+        if not self._is_dashboard_authorized(request, post_data):
+            return web.Response(status=401, text="Unauthorized")
+
+        order_id = self._to_int(post_data.get("order_id", 0), 0)
+        if order_id <= 0:
+            self._dashboard_redirect("无效兑换单号")
+
+        data = await self._load_data()
+        order = self._find_redeem_order(data, order_id)
+        if not order:
+            self._dashboard_redirect(f"未找到兑换单 #{order_id}")
+
+        status = str(order.get("status", ""))
+        if status == "已完成":
+            self._dashboard_redirect(f"兑换单 #{order_id} 已完成")
+        if status == "已处理":
+            self._dashboard_redirect(f"兑换单 #{order_id} 已是已处理")
+
+        order["status"] = "已处理"
+        order["updated_at"] = self._now_str()
+        order["handler_id"] = "dashboard"
+        order["handler_name"] = "看板同意兑换"
+        if not str(order.get("note", "")).strip():
+            order["note"] = "看板同意兑换"
+
+        await self._save_data(data)
+        self._dashboard_redirect(f"兑换单 #{order_id} 已同意")
+
     async def _dashboard_index(self, request):
-        token = self._cfg_str("dashboard_token", "").strip()
-        if token and request.query.get("token", "") != token:
+        if not self._is_dashboard_authorized(request):
             return web.Response(status=401, text="Unauthorized")
 
         data = await self._load_data()
-        html_text = self._build_dashboard_html(data)
+        flash_msg = str(request.query.get("msg", "")).strip()
+        html_text = self._build_dashboard_html(data, flash_msg)
         return web.Response(text=html_text, content_type="text/html")
 
-    def _build_dashboard_html(self, data: dict[str, Any]) -> str:
+    def _build_dashboard_html(self, data: dict[str, Any], flash_msg: str = "") -> str:
         title = escape(self._cfg_str("dashboard_title", "积分看板"))
         refresh_seconds = self._cfg_int("dashboard_auto_refresh_seconds", 15, 0, 3600)
+        dashboard_token = self._get_dashboard_token()
         refresh_meta = ""
         if refresh_seconds > 0:
             refresh_meta = f'<meta http-equiv="refresh" content="{refresh_seconds}">'
@@ -471,21 +528,42 @@ class PointsPlugin(Star):
         redeem_rows = []
         for item in records:
             order_id = self._to_int(item.get("id", 0), 0)
-            status = escape(str(item.get("status", "未知")))
+            status_raw = str(item.get("status", "未知"))
+            status = escape(status_raw)
             user_name = escape(str(item.get("user_name", "")))
             user_id = escape(str(item.get("user_id", "")))
             cost = self._to_int(item.get("cost", 0), 0)
             reason = escape(str(item.get("reason", "")).replace("\n", " "))
             updated_at = escape(str(item.get("updated_at", "")))
             handler_name = escape(str(item.get("handler_name", "")))
+
+            action_html = "-"
+            if status_raw == "已申请":
+                token_input = ""
+                if dashboard_token:
+                    token_input = (
+                        f'<input type="hidden" name="token" value="{escape(dashboard_token)}">'
+                    )
+                action_html = (
+                    '<form method="post" action="/redeem/approve" style="margin:0;">'
+                    f'<input type="hidden" name="order_id" value="{order_id}">'
+                    f"{token_input}"
+                    '<button type="submit">同意兑换</button>'
+                    "</form>"
+                )
+
             redeem_rows.append(
                 "<tr>"
                 f"<td>{order_id}</td><td>{status}</td><td>{user_name}</td><td>{user_id}</td>"
-                f"<td>{cost}</td><td>{reason}</td><td>{updated_at}</td><td>{handler_name}</td>"
+                f"<td>{cost}</td><td>{reason}</td><td>{updated_at}</td><td>{handler_name}</td><td>{action_html}</td>"
                 "</tr>"
             )
         if not redeem_rows:
-            redeem_rows.append('<tr><td colspan="8">暂无兑换记录</td></tr>')
+            redeem_rows.append('<tr><td colspan="9">暂无兑换记录</td></tr>')
+
+        flash_html = ""
+        if flash_msg:
+            flash_html = f'<div class="meta notice">操作结果：{escape(flash_msg)}</div>'
 
         return (
             "<!doctype html><html><head><meta charset=\"utf-8\">"
@@ -500,16 +578,20 @@ class PointsPlugin(Star):
             "th,td{border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;vertical-align:top;}"
             "th{background:#f3f4f6;}"
             ".meta{color:#4b5563;font-size:13px;margin:8px 0;}"
+            ".notice{color:#0f766e;font-weight:600;}"
+            "button{border:0;border-radius:8px;padding:6px 10px;background:#1d4ed8;color:#fff;cursor:pointer;}"
+            "button:hover{background:#1e40af;}"
             "</style></head><body>"
             f"<div class=\"card\"><h1>{title}</h1>"
             f"<div class=\"meta\">更新时间：{escape(self._now_str())} | 用户数：{len(users)} | 兑换单：{len(records)}</div>"
             f"<div class=\"meta\">状态统计：已申请 {status_counts['已申请']}，已处理 {status_counts['已处理']}，已完成 {status_counts['已完成']}</div>"
+            f"{flash_html}"
             "</div>"
             "<div class=\"card\"><h2>每个人的积分</h2>"
             "<table><thead><tr><th>排名</th><th>昵称</th><th>QQ</th><th>积分</th><th>连签</th></tr></thead>"
             f"<tbody>{''.join(points_rows)}</tbody></table></div>"
             "<div class=\"card\"><h2>兑换申请与记录</h2>"
-            "<table><thead><tr><th>单号</th><th>状态</th><th>申请人</th><th>QQ</th><th>积分</th><th>说明</th><th>更新时间</th><th>处理人</th></tr></thead>"
+            "<table><thead><tr><th>单号</th><th>状态</th><th>申请人</th><th>QQ</th><th>积分</th><th>说明</th><th>更新时间</th><th>处理人</th><th>操作</th></tr></thead>"
             f"<tbody>{''.join(redeem_rows)}</tbody></table></div>"
             "</body></html>"
         )
@@ -533,6 +615,24 @@ class PointsPlugin(Star):
             Comp.Plain(f" @{notify_qq} "),
             Comp.Plain(notify_text),
         ]
+
+    async def _notify_private_qq(self, event: AstrMessageEvent, notify_qq: str, notify_text: str) -> tuple[bool, str]:
+        platform_id = str(event.get_platform_id() or "").strip()
+        if not platform_id:
+            return False, "无法识别当前平台ID"
+
+        session = f"{platform_id}:FriendMessage:{notify_qq}"
+        try:
+            sent = await self.context.send_message(
+                session,
+                MessageChain([Comp.Plain(notify_text)]),
+            )
+            if sent:
+                return True, ""
+            return False, "未找到可发送的平台会话"
+        except Exception as exc:
+            logger.warning(f"发送私聊兑换通知失败: {exc}")
+            return False, str(exc)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def random_chat_reward(self, event: AstrMessageEvent):
@@ -805,7 +905,16 @@ class PointsPlugin(Star):
         )
 
         if notify_qq:
-            yield event.chain_result(self._build_notify_chain(notify_qq, notify_text))
+            if self._get_event_group_id(event):
+                yield event.chain_result(self._build_notify_chain(notify_qq, notify_text))
+            else:
+                yield event.plain_result(notify_text)
+
+            private_sent, private_err = await self._notify_private_qq(event, notify_qq, notify_text)
+            if private_sent:
+                yield event.plain_result(f"已私聊通知 {notify_qq}。")
+            else:
+                yield event.plain_result(f"群内提醒已发送，但私聊通知失败：{private_err}")
             return
 
         yield event.plain_result(f"兑换申请已创建，但未识别到有效通知QQ。{notify_text}")
@@ -1257,6 +1366,13 @@ class PointsPlugin(Star):
 
         await self._save_data(data)
         yield event.plain_result(f"兑换单 #{order_id} 状态已更新为 已处理。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("同意兑换", alias={"兑换同意"})
+    async def admin_redeem_approve(self, event: AstrMessageEvent, order_id: int, note: str = ""):
+        """管理员同意兑换（等价于兑换处理）。"""
+        async for result in self.admin_redeem_processing(event, order_id, note):
+            yield result
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("兑换完成")
