@@ -1,9 +1,11 @@
 from datetime import date, timedelta
 import random
+import re
 import time
 from typing import Any
 
 import astrbot.api.message_components as Comp
+from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
@@ -18,6 +20,8 @@ class PointsPlugin(Star):
 
     async def initialize(self):
         """插件初始化时自动调用。"""
+        data = await self._load_data()
+        self._refresh_webui_snapshot(data)
 
     @staticmethod
     def _to_int(value: Any, default: int) -> int:
@@ -183,7 +187,8 @@ class PointsPlugin(Star):
             settings.get("redeem_cost"),
             self._cfg_int("redeem_cost_points", 100, 1),
         )
-        notify_qq = str(settings.get("redeem_notify_qq", self._cfg_str("redeem_notify_qq", ""))).strip()
+        raw_notify = str(settings.get("redeem_notify_qq", self._cfg_str("redeem_notify_qq", ""))).strip()
+        notify_qq = self._normalize_qq(raw_notify)
         return max(1, redeem_cost), notify_qq
 
     def _get_lottery_pity_threshold(self, data: dict[str, Any]) -> int:
@@ -205,6 +210,104 @@ class PointsPlugin(Star):
             if self._to_int(item.get("id", 0), 0) == order_id:
                 return item
         return None
+
+    def _refresh_webui_snapshot(self, data: dict[str, Any]) -> None:
+        max_lines = self._cfg_int("webui_snapshot_max_lines", 300, 50, 5000)
+
+        users: list[tuple[str, str, int, int]] = []
+        for uid, item in data["users"].items():
+            if not isinstance(item, dict):
+                continue
+            users.append(
+                (
+                    str(uid),
+                    str(item.get("name") or uid),
+                    self._to_int(item.get("points", 0), 0),
+                    self._to_int(item.get("sign_streak", 0), 0),
+                )
+            )
+        users.sort(key=lambda x: (-x[2], x[0]))
+
+        points_lines = [
+            "# 积分看板",
+            f"更新时间: {self._now_str()}",
+            f"总用户数: {len(users)}",
+            "",
+            "排名 | 用户 | QQ | 积分 | 连签",
+            "---|---|---|---|---",
+        ]
+        for idx, (uid, name, points, streak) in enumerate(users[:max_lines], start=1):
+            points_lines.append(f"{idx} | {name} | {uid} | {points} | {streak}")
+        if len(users) > max_lines:
+            points_lines.append("")
+            points_lines.append(f"仅显示前 {max_lines} 条，其余请调整 webui_snapshot_max_lines。")
+
+        status_counts = {"已申请": 0, "已处理": 0, "已完成": 0}
+        records: list[dict[str, Any]] = []
+        for item in data["redeems"]:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status", ""))
+            if status in status_counts:
+                status_counts[status] += 1
+            records.append(item)
+
+        records.sort(key=lambda x: self._to_int(x.get("id", 0), 0), reverse=True)
+        redeem_lines = [
+            "# 兑换记录看板",
+            f"更新时间: {self._now_str()}",
+            f"总记录数: {len(records)}",
+            f"已申请: {status_counts['已申请']} | 已处理: {status_counts['已处理']} | 已完成: {status_counts['已完成']}",
+            "",
+            "单号 | 状态 | 用户 | QQ | 积分 | 说明 | 更新时间 | 处理人",
+            "---|---|---|---|---|---|---|---",
+        ]
+        for item in records[:max_lines]:
+            order_id = self._to_int(item.get("id", 0), 0)
+            status = str(item.get("status", "未知"))
+            user_name = str(item.get("user_name", ""))
+            user_id = str(item.get("user_id", ""))
+            cost = self._to_int(item.get("cost", 0), 0)
+            reason = str(item.get("reason", "")).replace("\n", " ")[:50]
+            updated_at = str(item.get("updated_at", ""))
+            handler_name = str(item.get("handler_name", ""))
+            redeem_lines.append(
+                f"{order_id} | {status} | {user_name} | {user_id} | {cost} | {reason} | {updated_at} | {handler_name}"
+            )
+        if len(records) > max_lines:
+            redeem_lines.append("")
+            redeem_lines.append(f"仅显示最近 {max_lines} 条，其余请调整 webui_snapshot_max_lines。")
+
+        if isinstance(self.config, dict):
+            self.config["webui_points_snapshot"] = "\n".join(points_lines)
+            self.config["webui_redeem_snapshot"] = "\n".join(redeem_lines)
+
+        save_fn = getattr(self.config, "save_config", None)
+        if callable(save_fn):
+            try:
+                save_fn()
+            except Exception as exc:
+                logger.warning(f"刷新 WebUI 看板失败: {exc}")
+
+    @staticmethod
+    def _normalize_qq(value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if text.isdigit():
+            return text
+        match = re.search(r"\d{5,}", text)
+        if match:
+            return match.group(0)
+        return ""
+
+    @staticmethod
+    def _build_notify_chain(notify_qq: str, notify_text: str) -> list[Any]:
+        return [
+            Comp.At(qq=notify_qq),
+            Comp.Plain(f" @{notify_qq} "),
+            Comp.Plain(notify_text),
+        ]
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def random_chat_reward(self, event: AstrMessageEvent):
@@ -242,16 +345,12 @@ class PointsPlugin(Star):
         gained = random.randint(reward_min, reward_max)
         self._change_points(user, gained)
         await self._save_data(data)
+        self._refresh_webui_snapshot(data)
         yield event.plain_result(
             f"随机奖励触发，{sender_name} 获得 {gained} 积分，当前积分 {user['points']}。"
         )
 
-    @filter.command_group("积分", alias={"point", "points", "jifen"})
-    def points(self):
-        """积分系统：签到、查询、排行、兑换与管理员配置。"""
-        pass
-
-    @points.command("签到")
+    @filter.command("签到")
     async def sign_in(self, event: AstrMessageEvent):
         """每日签到领取基础积分。"""
         sender_id = str(event.get_sender_id())
@@ -286,12 +385,13 @@ class PointsPlugin(Star):
         user["last_sign_date"] = today
         user["sign_streak"] = streak
         await self._save_data(data)
+        self._refresh_webui_snapshot(data)
         yield event.plain_result(
             f"签到成功，{sender_name} 连续签到 {streak} 天，"
             f"基础 {base_points} + 连签加成 {extra_bonus} = {sign_points} 积分，当前积分 {user['points']}。"
         )
 
-    @points.command("查询", alias={"余额", "我的积分"})
+    @filter.command("查询", alias={"余额", "我的积分"})
     async def query_points(self, event: AstrMessageEvent, qq: str = ""):
         """查询自己或指定 QQ 的积分。"""
         sender_id = str(event.get_sender_id())
@@ -309,7 +409,7 @@ class PointsPlugin(Star):
         streak = self._to_int(user.get("sign_streak", 0), 0)
         yield event.plain_result(f"{target_name}({target_id}) 当前积分：{user['points']}，连续签到：{streak} 天")
 
-    @points.command("排行", alias={"排行榜"})
+    @filter.command("排行", alias={"排行榜"})
     async def rank_points(self, event: AstrMessageEvent, top_n: int = 0):
         """查看积分排行榜。"""
         if top_n <= 0:
@@ -336,7 +436,7 @@ class PointsPlugin(Star):
             lines.append(f"{idx}. {name}({uid}) - {points}")
         yield event.plain_result("\n".join(lines))
 
-    @points.command("抽奖")
+    @filter.command("抽奖")
     async def lottery_draw(self, event: AstrMessageEvent, times: int = 1):
         """消耗积分进行抽奖，支持一等奖/二等奖/三等奖。"""
         if times <= 0:
@@ -396,6 +496,7 @@ class PointsPlugin(Star):
 
         self._change_points(sender_user, reward_total)
         await self._save_data(data)
+        self._refresh_webui_snapshot(data)
 
         pity_text = "保底已关闭"
         if pity_threshold > 0:
@@ -408,7 +509,7 @@ class PointsPlugin(Star):
             f"当前积分 {sender_user['points']}。"
         )
 
-    @points.command("兑换")
+    @filter.command("兑换")
     async def redeem_points(self, event: AstrMessageEvent, reason: str = "请处理兑换申请"):
         """达到兑换门槛后，创建兑换申请并提醒指定 QQ。"""
         sender_id = str(event.get_sender_id())
@@ -444,23 +545,20 @@ class PointsPlugin(Star):
             data["redeems"] = data["redeems"][-1000:]
 
         await self._save_data(data)
+        self._refresh_webui_snapshot(data)
 
         notify_text = (
             f"兑换申请 #{order_id}（状态：已申请）：{sender_name}({sender_id})"
             f" 使用 {redeem_cost} 积分，说明：{reason}。剩余积分 {sender_user['points']}。"
         )
 
-        if notify_qq.isdigit():
-            yield event.chain_result([Comp.At(qq=int(notify_qq)), Comp.Plain(" "), Comp.Plain(notify_text)])
-            return
-
         if notify_qq:
-            yield event.plain_result(f"提醒 @{notify_qq}：{notify_text}")
+            yield event.chain_result(self._build_notify_chain(notify_qq, notify_text))
             return
 
-        yield event.plain_result(f"兑换成功，但暂未设置通知 QQ。{notify_text}")
+        yield event.plain_result(f"兑换申请已创建，但未识别到有效通知QQ。{notify_text}")
 
-    @points.command("兑换状态")
+    @filter.command("兑换状态")
     async def redeem_status(self, event: AstrMessageEvent, order_id: int = 0):
         """查询兑换审核状态。"""
         sender_id = str(event.get_sender_id())
@@ -505,7 +603,7 @@ class PointsPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @points.command("加分")
+    @filter.command("加分")
     async def admin_add_points(self, event: AstrMessageEvent, qq: str, points: int):
         """管理员给指定 QQ 增加积分。"""
         if points <= 0:
@@ -516,10 +614,11 @@ class PointsPlugin(Star):
         user = self._ensure_user(data, qq)
         self._change_points(user, points)
         await self._save_data(data)
+        self._refresh_webui_snapshot(data)
         yield event.plain_result(f"已为 {qq} 增加 {points} 积分，当前 {user['points']}。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @points.command("扣分")
+    @filter.command("扣分")
     async def admin_sub_points(self, event: AstrMessageEvent, qq: str, points: int):
         """管理员扣除指定 QQ 的积分。"""
         if points <= 0:
@@ -530,10 +629,11 @@ class PointsPlugin(Star):
         user = self._ensure_user(data, qq)
         self._change_points(user, -points)
         await self._save_data(data)
+        self._refresh_webui_snapshot(data)
         yield event.plain_result(f"已扣除 {qq} {points} 积分，当前 {user['points']}。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @points.command("设置概率")
+    @filter.command("设置概率")
     async def admin_set_chance(self, event: AstrMessageEvent, chance_percent: int):
         """管理员设置聊天随机奖励概率。"""
         if chance_percent < 0 or chance_percent > 100:
@@ -546,7 +646,7 @@ class PointsPlugin(Star):
         yield event.plain_result(f"随机奖励概率已设置为 {chance_percent}%。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @points.command("设置范围")
+    @filter.command("设置范围")
     async def admin_set_range(self, event: AstrMessageEvent, reward_min: int, reward_max: int):
         """管理员设置聊天随机奖励积分区间。"""
         if reward_min <= 0 or reward_max <= 0:
@@ -563,7 +663,7 @@ class PointsPlugin(Star):
         yield event.plain_result(f"随机奖励范围已设置为 {reward_min}-{reward_max}。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @points.command("设置奖项")
+    @filter.command("设置奖项")
     async def admin_set_lottery_prize(self, event: AstrMessageEvent, level: int, points: int, chance_percent: int):
         """管理员设置抽奖奖项积分与概率。"""
         if level not in (1, 2, 3):
@@ -594,7 +694,7 @@ class PointsPlugin(Star):
         yield event.plain_result(f"抽奖奖项已更新：{level} 等奖 {points} 积分，概率 {chance_percent}%。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @points.command("设置抽奖消耗")
+    @filter.command("设置抽奖消耗")
     async def admin_set_lottery_cost(self, event: AstrMessageEvent, cost_points: int):
         """管理员设置每次抽奖消耗积分。"""
         if cost_points <= 0:
@@ -607,7 +707,7 @@ class PointsPlugin(Star):
         yield event.plain_result(f"每次抽奖消耗已设置为 {cost_points} 积分。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @points.command("设置兑换积分")
+    @filter.command("设置兑换积分")
     async def admin_set_redeem_cost(self, event: AstrMessageEvent, cost_points: int):
         """管理员设置固定兑换所需积分。"""
         if cost_points <= 0:
@@ -620,12 +720,12 @@ class PointsPlugin(Star):
         yield event.plain_result(f"兑换所需积分已设置为 {cost_points}。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @points.command("设置兑换通知")
+    @filter.command("设置兑换通知")
     async def admin_set_redeem_notify(self, event: AstrMessageEvent, notify_qq: str):
         """管理员设置兑换提醒 QQ。"""
-        notify_qq = notify_qq.strip()
+        notify_qq = self._normalize_qq(notify_qq)
         if not notify_qq:
-            yield event.plain_result("通知 QQ 不能为空。")
+            yield event.plain_result("通知 QQ 无效，请输入纯QQ号或包含QQ号的文本。")
             return
 
         data = await self._load_data()
@@ -634,7 +734,7 @@ class PointsPlugin(Star):
         yield event.plain_result(f"兑换通知 QQ 已设置为 {notify_qq}。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @points.command("设置保底")
+    @filter.command("设置保底")
     async def admin_set_lottery_pity(self, event: AstrMessageEvent, pity_threshold: int):
         """管理员设置抽奖保底阈值（连续未中奖次数）。"""
         if pity_threshold < 0:
@@ -651,7 +751,7 @@ class PointsPlugin(Star):
         yield event.plain_result(f"抽奖保底已设置：连续 {pity_threshold} 次未中奖，下次必出三等奖。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @points.command("兑换处理")
+    @filter.command("兑换处理")
     async def admin_redeem_processing(self, event: AstrMessageEvent, order_id: int, note: str = ""):
         """管理员将兑换单标记为已处理。"""
         data = await self._load_data()
@@ -674,10 +774,11 @@ class PointsPlugin(Star):
             order["note"] = note
 
         await self._save_data(data)
+        self._refresh_webui_snapshot(data)
         yield event.plain_result(f"兑换单 #{order_id} 状态已更新为 已处理。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @points.command("兑换完成")
+    @filter.command("兑换完成")
     async def admin_redeem_completed(self, event: AstrMessageEvent, order_id: int, note: str = ""):
         """管理员将兑换单标记为已完成。"""
         data = await self._load_data()
@@ -696,10 +797,11 @@ class PointsPlugin(Star):
             order["note"] = note
 
         await self._save_data(data)
+        self._refresh_webui_snapshot(data)
         yield event.plain_result(f"兑换单 #{order_id} 状态已更新为 已完成。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @points.command("兑换待处理")
+    @filter.command("兑换待处理")
     async def admin_redeem_pending(self, event: AstrMessageEvent, limit: int = 10):
         """管理员查看待处理兑换单（状态：已申请）。"""
         if limit <= 0:
@@ -727,7 +829,7 @@ class PointsPlugin(Star):
             )
         yield event.plain_result("\n".join(lines))
 
-    @points.command("设置")
+    @filter.command("设置")
     async def show_settings(self, event: AstrMessageEvent):
         """查看当前随机奖励配置。"""
         data = await self._load_data()
@@ -756,6 +858,14 @@ class PointsPlugin(Star):
             f"- 固定兑换积分：{redeem_cost}\n"
             f"- 兑换通知 QQ：{redeem_notify_qq or '未设置'}"
         )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("刷新看板")
+    async def refresh_webui_board(self, event: AstrMessageEvent):
+        """管理员手动刷新 WebUI 看板数据。"""
+        data = await self._load_data()
+        self._refresh_webui_snapshot(data)
+        yield event.plain_result("WebUI 看板已刷新，请在插件配置页查看积分与兑换记录。")
 
     async def terminate(self):
         """插件被卸载/停用时调用。"""

@@ -1,41 +1,50 @@
 {
   "random_reward_chance_percent": {
     "description": "聊天触发随机奖励的概率（百分比）",
+    "hint": "0-100，建议 1-20。",
+    "obvious_hint": true,
     "type": "int",
     "default": 5
   },
   "random_reward_min": {
     "description": "随机奖励积分最小值",
+    "hint": "必须大于 0，且不大于最大值。",
     "type": "int",
     "default": 1
   },
   "random_reward_max": {
     "description": "随机奖励积分最大值",
+    "hint": "必须大于 0，且不小于最小值。",
     "type": "int",
     "default": 10
   },
   "chat_reward_cooldown_seconds": {
     "description": "同一用户触发聊天奖励检测的冷却秒数",
+    "hint": "防刷分。0 表示不冷却。",
     "type": "int",
     "default": 30
   },
   "sign_in_points": {
     "description": "每日签到固定奖励积分",
+    "hint": "基础奖励，不包含连签加成。",
     "type": "int",
     "default": 8
   },
   "sign_in_streak_bonus_per_day": {
     "description": "连续签到每天额外增加的积分",
+    "hint": "例如设置 2，则第3天比第1天多 4 积分加成。",
     "type": "int",
     "default": 2
   },
   "sign_in_streak_bonus_max": {
     "description": "连续签到加成积分上限",
+    "hint": "用于限制连签加成最高值。",
     "type": "int",
     "default": 30
   },
   "lottery_cost_points": {
     "description": "每次抽奖消耗积分",
+    "hint": "抽奖时每一抽扣除的积分。",
     "type": "int",
     "default": 10
   },
@@ -46,6 +55,7 @@
   },
   "lottery_prize_1_chance_percent": {
     "description": "一等奖概率（百分比）",
+    "hint": "三档奖项概率总和不能超过 100。",
     "type": "int",
     "default": 1
   },
@@ -56,6 +66,7 @@
   },
   "lottery_prize_2_chance_percent": {
     "description": "二等奖概率（百分比）",
+    "hint": "三档奖项概率总和不能超过 100。",
     "type": "int",
     "default": 5
   },
@@ -66,26 +77,56 @@
   },
   "lottery_prize_3_chance_percent": {
     "description": "三等奖概率（百分比）",
+    "hint": "三档奖项概率总和不能超过 100。",
     "type": "int",
     "default": 20
   },
   "lottery_pity_threshold": {
     "description": "抽奖保底阈值：连续未中奖多少次后下次必出三等奖，0为关闭",
+    "hint": "例如 10 表示连续 9 次未中奖，第 10 次必出三等奖。",
     "type": "int",
     "default": 10
   },
   "redeem_cost_points": {
     "description": "固定兑换需要消耗的积分",
+    "hint": "成员发起兑换时固定扣除。",
     "type": "int",
     "default": 100
   },
   "redeem_notify_qq": {
     "description": "兑换后通知的 QQ 号",
+    "hint": "可填纯QQ号或包含QQ号的文本，插件会自动提取数字。",
+    "obvious_hint": true,
     "type": "string",
     "default": ""
   },
+  "webui_snapshot_max_lines": {
+    "description": "WebUI看板最多显示记录条数",
+    "hint": "同时影响积分看板和兑换记录看板，建议 100-1000。",
+    "type": "int",
+    "default": 300
+  },
+  "webui_points_snapshot": {
+    "description": "WebUI 积分看板（自动生成）",
+    "hint": "只读展示。插件会自动刷新，不建议手动编辑。",
+    "obvious_hint": true,
+    "type": "text",
+    "default": "",
+    "editor_mode": true,
+    "editor_language": "markdown"
+  },
+  "webui_redeem_snapshot": {
+    "description": "WebUI 兑换记录看板（自动生成）",
+    "hint": "只读展示。插件会自动刷新，不建议手动编辑。",
+    "obvious_hint": true,
+    "type": "text",
+    "default": "",
+    "editor_mode": true,
+    "editor_language": "markdown"
+  },
   "leaderboard_default_size": {
     "description": "排行榜默认展示人数",
+    "hint": "建议 5-20。",
     "type": "int",
     "default": 10
   }
