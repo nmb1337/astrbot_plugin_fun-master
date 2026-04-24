@@ -1,6 +1,6 @@
 name: astrbot_plugin_fun
 display_name: 聊天积分玩法
 desc: 支持随机聊天奖励、签到、查询、排行、管理员增减和积分兑换提醒。
-version: v1.0.0
+version: v1.1.0
 author: Copilot
 repo: https://github.com/yourname/astrbot_plugin_fun

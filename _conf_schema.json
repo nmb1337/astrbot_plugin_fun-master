@@ -24,6 +24,12 @@
     "type": "int",
     "default": 30
   },
+  "group_chat_reward_for_members": {
+    "description": "群成员互相聊天是否也可触发积分奖励",
+    "hint": "开启后，群里普通聊天（不@机器人）也会参与随机奖励。",
+    "type": "bool",
+    "default": true
+  },
   "sign_in_points": {
     "description": "每日签到固定奖励积分",
     "hint": "基础奖励，不包含连签加成。",
@@ -41,6 +47,24 @@
     "hint": "用于限制连签加成最高值。",
     "type": "int",
     "default": 30
+  },
+  "sign_in_lucky_bonus_chance_percent": {
+    "description": "签到幸运加成触发概率（百分比）",
+    "hint": "触发后可额外获得 1-10（可配置）积分。",
+    "type": "int",
+    "default": 20
+  },
+  "sign_in_lucky_bonus_min": {
+    "description": "签到幸运加成最小积分",
+    "hint": "触发签到幸运加成时的最小额外积分。",
+    "type": "int",
+    "default": 1
+  },
+  "sign_in_lucky_bonus_max": {
+    "description": "签到幸运加成最大积分",
+    "hint": "触发签到幸运加成时的最大额外积分。",
+    "type": "int",
+    "default": 10
   },
   "lottery_cost_points": {
     "description": "每次抽奖消耗积分",
@@ -100,6 +124,12 @@
     "type": "string",
     "default": ""
   },
+  "redeem_products": {
+    "description": "兑换商品名称列表",
+    "hint": "可在 16666 看板直接编辑；留空时会自动生成默认商品位名称。",
+    "type": "list",
+    "default": []
+  },
   "group_enable_private": {
     "description": "私聊是否启用积分功能",
     "hint": "当关闭时，私聊中所有积分相关指令不可用。",
@@ -137,6 +167,18 @@
     "type": "int",
     "default": 16666,
     "obvious_hint": true
+  },
+  "dashboard_product_slot_count": {
+    "description": "商品位默认数量",
+    "hint": "首次生成商品位时使用，建议 8-20。",
+    "type": "int",
+    "default": 12
+  },
+  "dashboard_product_slots_max": {
+    "description": "商品位上限数量",
+    "hint": "看板页面可新增商品位，最多不超过该值。",
+    "type": "int",
+    "default": 30
   },
   "dashboard_title": {
     "description": "看板网页标题",

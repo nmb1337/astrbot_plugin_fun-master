@@ -17,11 +17,13 @@ except ImportError:
     web = None
 
 
-@register("astrbot_plugin_fun", "Copilot", "聊天积分玩法插件", "1.0.0")
+@register("astrbot_plugin_fun", "Copilot", "聊天积分玩法插件", "1.1.0")
 class PointsPlugin(Star):
     DATA_KEY = "points_data_v1"
     SPEECH_DAILY_RETENTION_DAYS = 62
     SPEECH_MONTHLY_RETENTION_MONTHS = 18
+    DEFAULT_PRODUCT_SLOT_COUNT = 12
+    DEFAULT_PRODUCT_SLOT_MAX = 30
 
     def __init__(self, context: Context, config: Any = None):
         super().__init__(context)
@@ -398,6 +400,85 @@ class PointsPlugin(Star):
             reward_min, reward_max = reward_max, reward_min
         return chance, reward_min, reward_max
 
+    def _get_sign_in_lucky_settings(self, data: dict[str, Any]) -> tuple[int, int, int]:
+        settings = data["settings"]
+        chance = self._to_int(
+            settings.get("sign_lucky_bonus_chance"),
+            self._cfg_int("sign_in_lucky_bonus_chance_percent", 20, 0, 100),
+        )
+        bonus_min = self._to_int(
+            settings.get("sign_lucky_bonus_min"),
+            self._cfg_int("sign_in_lucky_bonus_min", 1, 1),
+        )
+        bonus_max = self._to_int(
+            settings.get("sign_lucky_bonus_max"),
+            self._cfg_int("sign_in_lucky_bonus_max", 10, 1),
+        )
+
+        chance = max(0, min(100, chance))
+        bonus_min = max(1, bonus_min)
+        bonus_max = max(1, bonus_max)
+        if bonus_min > bonus_max:
+            bonus_min, bonus_max = bonus_max, bonus_min
+        return chance, bonus_min, bonus_max
+
+    @staticmethod
+    def _sanitize_product_name(value: Any, fallback: str) -> str:
+        name = str(value or "").strip()
+        if not name:
+            return fallback
+        return name[:40]
+
+    def _get_redeem_products(self, data: dict[str, Any]) -> list[str]:
+        settings = data["settings"]
+        config_products = []
+        if isinstance(self.config, dict):
+            config_products = self.config.get("redeem_products", [])
+        raw_products = settings.get("redeem_products", config_products)
+        products: list[str] = []
+
+        if isinstance(raw_products, list):
+            for item in raw_products:
+                name = str(item or "").strip()
+                if name:
+                    products.append(name[:40])
+        else:
+            text = str(raw_products or "")
+            for item in re.split(r"[,，;；\n\r\t]+", text):
+                name = item.strip()
+                if name:
+                    products.append(name[:40])
+
+        slot_count = self._cfg_int(
+            "dashboard_product_slot_count",
+            self.DEFAULT_PRODUCT_SLOT_COUNT,
+            1,
+            self.DEFAULT_PRODUCT_SLOT_MAX,
+        )
+        slot_max = self._cfg_int(
+            "dashboard_product_slots_max",
+            self.DEFAULT_PRODUCT_SLOT_MAX,
+            slot_count,
+            100,
+        )
+
+        products = products[:slot_max]
+        while len(products) < slot_count:
+            products.append(f"商品{len(products) + 1}")
+        return products
+
+    def _set_redeem_products(self, data: dict[str, Any], products: list[str]) -> None:
+        slot_max = self._cfg_int(
+            "dashboard_product_slots_max",
+            self.DEFAULT_PRODUCT_SLOT_MAX,
+            1,
+            100,
+        )
+        normalized: list[str] = []
+        for idx, item in enumerate(products[:slot_max], start=1):
+            normalized.append(self._sanitize_product_name(item, f"商品{idx}"))
+        data["settings"]["redeem_products"] = normalized
+
     def _get_lottery_settings(self, data: dict[str, Any]) -> dict[str, Any]:
         settings = data["settings"]
         draw_cost = self._to_int(settings.get("lottery_cost"), self._cfg_int("lottery_cost_points", 10, 1))
@@ -536,6 +617,8 @@ class PointsPlugin(Star):
         app.router.add_get("/", self._dashboard_index)
         app.router.add_get("/healthz", self._dashboard_health)
         app.router.add_post("/redeem/approve", self._dashboard_redeem_approve)
+        app.router.add_post("/products/update", self._dashboard_product_update)
+        app.router.add_post("/products/add", self._dashboard_product_add)
 
         runner = web.AppRunner(app)
         try:
@@ -599,6 +682,50 @@ class PointsPlugin(Star):
         await self._save_data(data)
         self._dashboard_redirect(f"兑换单 #{order_id} 已同意")
 
+    async def _dashboard_product_update(self, request):
+        post_data = await request.post()
+        if not self._is_dashboard_authorized(request, post_data):
+            return web.Response(status=401, text="Unauthorized")
+
+        slot = self._to_int(post_data.get("slot", 0), 0)
+        if slot <= 0:
+            self._dashboard_redirect("无效商品位")
+
+        data = await self._load_data()
+        products = self._get_redeem_products(data)
+        if slot > len(products):
+            self._dashboard_redirect("商品位不存在")
+
+        name = self._sanitize_product_name(post_data.get("name", ""), f"商品{slot}")
+        products[slot - 1] = name
+        self._set_redeem_products(data, products)
+        await self._save_data(data)
+        self._dashboard_redirect(f"商品位 #{slot} 已更新")
+
+    async def _dashboard_product_add(self, request):
+        post_data = await request.post()
+        if not self._is_dashboard_authorized(request, post_data):
+            return web.Response(status=401, text="Unauthorized")
+
+        data = await self._load_data()
+        products = self._get_redeem_products(data)
+        slot_max = self._cfg_int(
+            "dashboard_product_slots_max",
+            self.DEFAULT_PRODUCT_SLOT_MAX,
+            1,
+            100,
+        )
+
+        if len(products) >= slot_max:
+            self._dashboard_redirect(f"商品位已达上限（{slot_max}）")
+
+        new_slot = len(products) + 1
+        name = self._sanitize_product_name(post_data.get("name", ""), f"商品{new_slot}")
+        products.append(name)
+        self._set_redeem_products(data, products)
+        await self._save_data(data)
+        self._dashboard_redirect(f"已新增商品位 #{new_slot}")
+
     async def _dashboard_index(self, request):
         if not self._is_dashboard_authorized(request):
             return web.Response(status=401, text="Unauthorized")
@@ -612,6 +739,13 @@ class PointsPlugin(Star):
         title = escape(self._cfg_str("dashboard_title", "积分看板"))
         refresh_seconds = self._cfg_int("dashboard_auto_refresh_seconds", 15, 0, 3600)
         dashboard_token = self._get_dashboard_token()
+        products = self._get_redeem_products(data)
+        product_slot_max = self._cfg_int(
+            "dashboard_product_slots_max",
+            self.DEFAULT_PRODUCT_SLOT_MAX,
+            1,
+            100,
+        )
         refresh_meta = ""
         if refresh_seconds > 0:
             refresh_meta = f'<meta http-equiv="refresh" content="{refresh_seconds}">'
@@ -724,6 +858,41 @@ class PointsPlugin(Star):
         if flash_msg:
             flash_html = f'<div class="meta notice">操作结果：{escape(flash_msg)}</div>'
 
+        product_rows = []
+        token_input = ""
+        if dashboard_token:
+            token_input = f'<input type="hidden" name="token" value="{escape(dashboard_token)}">'
+
+        for idx, name in enumerate(products, start=1):
+            product_rows.append(
+                "<tr>"
+                f"<td>{idx}</td>"
+                f"<td>{escape(name)}</td>"
+                "<td>"
+                '<form method="post" action="/products/update" class="inline-form">'
+                f"{token_input}"
+                f'<input type="hidden" name="slot" value="{idx}">'
+                f'<input type="text" name="name" value="{escape(name)}" maxlength="40">'
+                '<button type="submit">保存</button>'
+                "</form>"
+                "</td>"
+                "</tr>"
+            )
+        if not product_rows:
+            product_rows.append('<tr><td colspan="3">暂无商品位</td></tr>')
+
+        add_product_form = ""
+        if len(products) < product_slot_max:
+            add_product_form = (
+                '<form method="post" action="/products/add" class="inline-form">'
+                f"{token_input}"
+                '<input type="text" name="name" placeholder="新商品名（可留空自动命名）" maxlength="40">'
+                '<button type="submit">新增商品位</button>'
+                "</form>"
+            )
+        else:
+            add_product_form = f'<div class="meta">商品位已达到上限：{product_slot_max}</div>'
+
         return (
             "<!doctype html><html><head><meta charset=\"utf-8\">"
             f"{refresh_meta}"
@@ -738,6 +907,8 @@ class PointsPlugin(Star):
             "th{background:#f3f4f6;}"
             ".meta{color:#4b5563;font-size:13px;margin:8px 0;}"
             ".notice{color:#0f766e;font-weight:600;}"
+            ".inline-form{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}"
+            "input[type=text]{min-width:220px;padding:6px 8px;border:1px solid #d1d5db;border-radius:8px;}"
             "button{border:0;border-radius:8px;padding:6px 10px;background:#1d4ed8;color:#fff;cursor:pointer;}"
             "button:hover{background:#1e40af;}"
             "</style></head><body>"
@@ -757,6 +928,11 @@ class PointsPlugin(Star):
             f"<div class=\"meta\">当月总发言：{monthly_total} 条，展示前 200 名</div>"
             "<table><thead><tr><th>排名</th><th>群号</th><th>昵称</th><th>QQ</th><th>发言次数</th></tr></thead>"
             f"<tbody>{''.join(speech_monthly_rows)}</tbody></table></div>"
+            "<div class=\"card\"><h2>兑换商品位（可自定义名称）</h2>"
+            f"<div class=\"meta\">当前商品位：{len(products)} / {product_slot_max}</div>"
+            "<table><thead><tr><th>商品位</th><th>商品名称</th><th>编辑</th></tr></thead>"
+            f"<tbody>{''.join(product_rows)}</tbody></table>"
+            f"{add_product_form}</div>"
             "<div class=\"card\"><h2>兑换申请与记录</h2>"
             "<table><thead><tr><th>单号</th><th>状态</th><th>申请人</th><th>QQ</th><th>积分</th><th>说明</th><th>更新时间</th><th>处理人</th><th>操作</th></tr></thead>"
             f"<tbody>{''.join(redeem_rows)}</tbody></table></div>"
@@ -813,20 +989,25 @@ class PointsPlugin(Star):
 
         sender_id = str(event.get_sender_id())
         sender_name = event.get_sender_name() or sender_id
+        self_id = str(event.get_self_id() or "").strip()
+        if self_id and sender_id == self_id:
+            return
 
         data: dict[str, Any] | None = None
         user: dict[str, Any] | None = None
         speech_changed = False
+        group_id = self._get_event_group_id(event)
 
-        if self._get_event_group_id(event):
+        if group_id:
             data = await self._load_data()
             user = self._ensure_user(data, sender_id, sender_name)
             speech_changed = self._record_group_speech_stat(data, event, sender_name)
 
-        if not self._is_message_to_bot(event):
-            if speech_changed and data is not None:
-                await self._save_data(data)
-            return
+            allow_member_chat_reward = self._cfg_bool("group_chat_reward_for_members", True)
+            if not allow_member_chat_reward and not self._is_message_to_bot(event):
+                if speech_changed:
+                    await self._save_data(data)
+                return
 
         if message_str.startswith("/"):
             if speech_changed and data is not None:
@@ -897,18 +1078,27 @@ class PointsPlugin(Star):
         base_points = self._cfg_int("sign_in_points", 8, 1, 10000)
         streak_bonus_per_day = self._cfg_int("sign_in_streak_bonus_per_day", 2, 0, 10000)
         streak_bonus_max = self._cfg_int("sign_in_streak_bonus_max", 30, 0, 100000)
+        lucky_chance, lucky_min, lucky_max = self._get_sign_in_lucky_settings(data)
 
         extra_bonus = max(0, streak - 1) * streak_bonus_per_day
         extra_bonus = min(extra_bonus, streak_bonus_max)
-        sign_points = base_points + extra_bonus
+        lucky_bonus = 0
+        if lucky_chance >= 100 or (lucky_chance > 0 and random.randint(1, 100) <= lucky_chance):
+            lucky_bonus = random.randint(lucky_min, lucky_max)
+        sign_points = base_points + extra_bonus + lucky_bonus
 
         self._change_points(user, sign_points)
         user["last_sign_date"] = today
         user["sign_streak"] = streak
         await self._save_data(data)
+
+        lucky_text = ""
+        if lucky_bonus > 0:
+            lucky_text = f"，签到幸运加成 {lucky_bonus}"
+
         yield event.plain_result(
             f"签到成功，{sender_name} 连续签到 {streak} 天，"
-            f"基础 {base_points} + 连签加成 {extra_bonus} = {sign_points} 积分，当前积分 {user['points']}。"
+            f"基础 {base_points} + 连签加成 {extra_bonus}{lucky_text} = {sign_points} 积分，当前积分 {user['points']}。"
         )
 
     @filter.command("查询", alias={"余额", "我的积分"})
@@ -1635,6 +1825,7 @@ class PointsPlugin(Star):
         sign_points = self._cfg_int("sign_in_points", 8, 1, 10000)
         streak_bonus_per_day = self._cfg_int("sign_in_streak_bonus_per_day", 2, 0, 10000)
         streak_bonus_max = self._cfg_int("sign_in_streak_bonus_max", 30, 0, 100000)
+        lucky_chance, lucky_min, lucky_max = self._get_sign_in_lucky_settings(data)
         lottery = self._get_lottery_settings(data)
         pity_threshold = self._get_lottery_pity_threshold(data)
         redeem_cost, redeem_notify_qq = self._get_redeem_settings(data)
@@ -1644,8 +1835,10 @@ class PointsPlugin(Star):
             f"- 聊天触发概率：{chance}%\n"
             f"- 随机奖励范围：{reward_min}-{reward_max}\n"
             f"- 聊天奖励冷却：{cooldown} 秒\n"
+            f"- 群成员互聊可触发奖励：{'是' if self._cfg_bool('group_chat_reward_for_members', True) else '否'}\n"
             f"- 每日签到基础奖励：{sign_points}\n"
             f"- 连签每日加成：{streak_bonus_per_day}（上限 {streak_bonus_max}）\n"
+            f"- 签到幸运加成概率：{lucky_chance}%（触发时 +{lucky_min}-{lucky_max}）\n"
             f"- 每次抽奖消耗：{lottery['cost']}\n"
             f"- 一等奖：{p1[1]} 积分，概率 {p1[2]}%\n"
             f"- 二等奖：{p2[1]} 积分，概率 {p2[2]}%\n"
