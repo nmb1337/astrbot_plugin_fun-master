@@ -24,6 +24,12 @@
     "type": "int",
     "default": 30
   },
+  "chat_reward_message_template": {
+    "description": "聊天随机奖励消息模板",
+    "hint": "可用变量: {name}=昵称, {gained}=获得积分, {points}=当前积分。例如: 恭喜！健谈的{name}获得了{gained}积分",
+    "type": "string",
+    "default": "随机奖励触发，{name} 获得 {gained} 积分，当前积分 {points}。"
+  },
   "group_chat_reward_for_members": {
     "description": "群成员互相聊天是否也可触发积分奖励",
     "hint": "开启后，群里普通聊天（不@机器人）也会参与随机奖励。",
@@ -65,6 +71,12 @@
     "hint": "触发签到幸运加成时的最大额外积分。",
     "type": "int",
     "default": 10
+  },
+  "sign_in_message_template": {
+    "description": "签到成功消息模板",
+    "hint": "可用变量: {name}=昵称, {streak}=连签天数, {base}=基础奖励, {extra}=连签加成, {lucky}=幸运奖励(0时不显示), {lucky_text}=幸运加成文案, {total}=总获积分, {points}=当前积分。",
+    "type": "string",
+    "default": "签到成功，{name} 连续签到 {streak} 天，基础 {base} + 连签加成 {extra}{lucky_text} = {total} 积分，当前积分 {points}。"
   },
   "lottery_cost_points": {
     "description": "每次抽奖消耗积分",

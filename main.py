@@ -21,9 +21,17 @@ except ImportError:
 class PointsPlugin(Star):
     DATA_KEY = "points_data_v1"
     SPEECH_DAILY_RETENTION_DAYS = 62
+    SPEECH_WEEKLY_RETENTION_WEEKS = 26
     SPEECH_MONTHLY_RETENTION_MONTHS = 18
     DEFAULT_PRODUCT_SLOT_COUNT = 12
     DEFAULT_PRODUCT_SLOT_MAX = 30
+
+    # 签到/奖励消息模板的默认值
+    DEFAULT_SIGN_IN_TEMPLATE = (
+        "签到成功，{name} 连续签到 {streak} 天，"
+        "基础 {base} + 连签加成 {extra}{lucky_text} = {total} 积分，当前积分 {points}。"
+    )
+    DEFAULT_CHAT_REWARD_TEMPLATE = "随机奖励触发，{name} 获得 {gained} 积分，当前积分 {points}。"
 
     def __init__(self, context: Context, config: Any = None):
         super().__init__(context)
@@ -222,7 +230,9 @@ class PointsPlugin(Star):
         redeems = data.get("redeems", [])
         redeem_seq = self._to_int(data.get("redeem_seq", 0), 0)
         speech_daily = data.get("speech_daily", {})
+        speech_weekly = data.get("speech_weekly", {})
         speech_monthly = data.get("speech_monthly", {})
+        speech_total = data.get("speech_total", {})
         if not isinstance(users, dict):
             users = {}
         if not isinstance(settings, dict):
@@ -233,8 +243,12 @@ class PointsPlugin(Star):
             redeems = []
         if not isinstance(speech_daily, dict):
             speech_daily = {}
+        if not isinstance(speech_weekly, dict):
+            speech_weekly = {}
         if not isinstance(speech_monthly, dict):
             speech_monthly = {}
+        if not isinstance(speech_total, dict):
+            speech_total = {}
 
         return {
             "users": users,
@@ -243,7 +257,9 @@ class PointsPlugin(Star):
             "redeems": redeems,
             "redeem_seq": max(0, redeem_seq),
             "speech_daily": speech_daily,
+            "speech_weekly": speech_weekly,
             "speech_monthly": speech_monthly,
+            "speech_total": speech_total,
         }
 
     async def _save_data(self, data: dict[str, Any]) -> None:
@@ -289,10 +305,14 @@ class PointsPlugin(Star):
 
     def _prune_speech_stats(self, data: dict[str, Any]) -> None:
         speech_daily = data.get("speech_daily")
+        speech_weekly = data.get("speech_weekly")
         speech_monthly = data.get("speech_monthly")
         if not isinstance(speech_daily, dict):
             data["speech_daily"] = {}
             speech_daily = data["speech_daily"]
+        if not isinstance(speech_weekly, dict):
+            data["speech_weekly"] = {}
+            speech_weekly = data["speech_weekly"]
         if not isinstance(speech_monthly, dict):
             data["speech_monthly"] = {}
             speech_monthly = data["speech_monthly"]
@@ -303,6 +323,22 @@ class PointsPlugin(Star):
             valid = isinstance(day_key, str) and day_key >= daily_cutoff and isinstance(speech_daily.get(day_key), dict)
             if not valid:
                 speech_daily.pop(day_key, None)
+
+        # 周榜清理：按 ISO 周计算
+        today_iso = today.isocalendar()
+        today_week_idx = today_iso[0] * 53 + today_iso[1]
+        week_cutoff = today_week_idx - self.SPEECH_WEEKLY_RETENTION_WEEKS
+        for week_key in list(speech_weekly.keys()):
+            try:
+                wk_str = str(week_key)
+                parts = wk_str.split("-W")
+                year = int(parts[0])
+                week_num = int(parts[1])
+                wk_idx = year * 53 + week_num
+                if wk_idx < week_cutoff or not isinstance(speech_weekly.get(week_key), dict):
+                    speech_weekly.pop(week_key, None)
+            except (ValueError, IndexError):
+                speech_weekly.pop(week_key, None)
 
         current_month_idx = today.year * 12 + today.month
         month_cutoff = current_month_idx - self.SPEECH_MONTHLY_RETENTION_MONTHS
@@ -355,9 +391,13 @@ class PointsPlugin(Star):
 
         self._prune_speech_stats(data)
         today_key = date.today().isoformat()
+        today_iso = date.today().isocalendar()
+        week_key = f"{today_iso[0]}-W{today_iso[1]:02d}"
         month_key = today_key[:7]
         self._increment_speech_count(data["speech_daily"], today_key, group_id, sender_id, sender_name)
+        self._increment_speech_count(data["speech_weekly"], week_key, group_id, sender_id, sender_name)
         self._increment_speech_count(data["speech_monthly"], month_key, group_id, sender_id, sender_name)
+        self._increment_speech_count(data["speech_total"], "__total__", group_id, sender_id, sender_name)
         return True
 
     def _flatten_speech_rows(self, period_data: Any) -> list[tuple[str, str, str, int]]:
@@ -428,6 +468,18 @@ class PointsPlugin(Star):
         if not name:
             return fallback
         return name[:40]
+
+    def _get_message_template(self, key: str, default_template: str) -> str:
+        tmpl = self._cfg_str(key, default_template)
+        if not tmpl or not tmpl.strip():
+            return default_template
+        return tmpl
+
+    def _format_template(self, template: str, **kwargs: Any) -> str:
+        result = template
+        for key, value in kwargs.items():
+            result = result.replace("{" + key + "}", str(value))
+        return result
 
     def _get_redeem_products(self, data: dict[str, Any]) -> list[str]:
         settings = data["settings"]
@@ -751,17 +803,29 @@ class PointsPlugin(Star):
             refresh_meta = f'<meta http-equiv="refresh" content="{refresh_seconds}">'
 
         today_key = date.today().isoformat()
+        today_iso = date.today().isocalendar()
+        week_key = f"{today_iso[0]}-W{today_iso[1]:02d}"
         month_key = today_key[:7]
         speech_daily = data.get("speech_daily", {})
+        speech_weekly = data.get("speech_weekly", {})
         speech_monthly = data.get("speech_monthly", {})
+        speech_total = data.get("speech_total", {})
         daily_rows_data = self._flatten_speech_rows(
             speech_daily.get(today_key, {}) if isinstance(speech_daily, dict) else {}
+        )
+        weekly_rows_data = self._flatten_speech_rows(
+            speech_weekly.get(week_key, {}) if isinstance(speech_weekly, dict) else {}
         )
         monthly_rows_data = self._flatten_speech_rows(
             speech_monthly.get(month_key, {}) if isinstance(speech_monthly, dict) else {}
         )
+        total_rows_data = self._flatten_speech_rows(
+            speech_total.get("__total__", {}) if isinstance(speech_total, dict) else {}
+        )
         daily_total = sum(row[3] for row in daily_rows_data)
+        weekly_total = sum(row[3] for row in weekly_rows_data)
         monthly_total = sum(row[3] for row in monthly_rows_data)
+        total_all = sum(row[3] for row in total_rows_data)
 
         users: list[tuple[str, str, int, int]] = []
         for uid, item in data["users"].items():
@@ -797,6 +861,16 @@ class PointsPlugin(Star):
         if not speech_daily_rows:
             speech_daily_rows.append('<tr><td colspan="5">今日暂无发言数据</td></tr>')
 
+        speech_weekly_rows = []
+        for idx, (group_id, name, uid, count) in enumerate(weekly_rows_data[:200], start=1):
+            speech_weekly_rows.append(
+                "<tr>"
+                f"<td>{idx}</td><td>{escape(group_id)}</td><td>{escape(name)}</td><td>{escape(uid)}</td><td>{count}</td>"
+                "</tr>"
+            )
+        if not speech_weekly_rows:
+            speech_weekly_rows.append('<tr><td colspan="5">本周暂无发言数据</td></tr>')
+
         speech_monthly_rows = []
         for idx, (group_id, name, uid, count) in enumerate(monthly_rows_data[:200], start=1):
             speech_monthly_rows.append(
@@ -806,6 +880,16 @@ class PointsPlugin(Star):
             )
         if not speech_monthly_rows:
             speech_monthly_rows.append('<tr><td colspan="5">本月暂无发言数据</td></tr>')
+
+        speech_total_rows = []
+        for idx, (group_id, name, uid, count) in enumerate(total_rows_data[:200], start=1):
+            speech_total_rows.append(
+                "<tr>"
+                f"<td>{idx}</td><td>{escape(group_id)}</td><td>{escape(name)}</td><td>{escape(uid)}</td><td>{count}</td>"
+                "</tr>"
+            )
+        if not speech_total_rows:
+            speech_total_rows.append('<tr><td colspan="5">暂无发言数据</td></tr>')
 
         status_counts = {"已申请": 0, "已处理": 0, "已完成": 0}
         records: list[dict[str, Any]] = []
@@ -924,10 +1008,18 @@ class PointsPlugin(Star):
             f"<div class=\"meta\">当日总发言：{daily_total} 条，展示前 200 名</div>"
             "<table><thead><tr><th>排名</th><th>群号</th><th>昵称</th><th>QQ</th><th>发言次数</th></tr></thead>"
             f"<tbody>{''.join(speech_daily_rows)}</tbody></table></div>"
+            f"<div class=\"card\"><h2>群成员每周发言统计（{escape(week_key)}）</h2>"
+            f"<div class=\"meta\">本周总发言：{weekly_total} 条，展示前 200 名</div>"
+            "<table><thead><tr><th>排名</th><th>群号</th><th>昵称</th><th>QQ</th><th>发言次数</th></tr></thead>"
+            f"<tbody>{''.join(speech_weekly_rows)}</tbody></table></div>"
             f"<div class=\"card\"><h2>群成员每月发言统计（{escape(month_key)}）</h2>"
             f"<div class=\"meta\">当月总发言：{monthly_total} 条，展示前 200 名</div>"
             "<table><thead><tr><th>排名</th><th>群号</th><th>昵称</th><th>QQ</th><th>发言次数</th></tr></thead>"
             f"<tbody>{''.join(speech_monthly_rows)}</tbody></table></div>"
+            f"<div class=\"card\"><h2>群成员总发言统计（自记录以来）</h2>"
+            f"<div class=\"meta\">总发言：{total_all} 条，展示前 200 名</div>"
+            "<table><thead><tr><th>排名</th><th>群号</th><th>昵称</th><th>QQ</th><th>发言次数</th></tr></thead>"
+            f"<tbody>{''.join(speech_total_rows)}</tbody></table></div>"
             "<div class=\"card\"><h2>兑换商品位（可自定义名称）</h2>"
             f"<div class=\"meta\">当前商品位：{len(products)} / {product_slot_max}</div>"
             "<table><thead><tr><th>商品位</th><th>商品名称</th><th>编辑</th></tr></thead>"
@@ -1039,9 +1131,13 @@ class PointsPlugin(Star):
         gained = random.randint(reward_min, reward_max)
         self._change_points(user, gained)
         await self._save_data(data)
-        yield event.plain_result(
-            f"随机奖励触发，{sender_name} 获得 {gained} 积分，当前积分 {user['points']}。"
-        )
+        tmpl = self._get_message_template("chat_reward_message_template", self.DEFAULT_CHAT_REWARD_TEMPLATE)
+        yield event.plain_result(self._format_template(
+            tmpl,
+            name=sender_name,
+            gained=gained,
+            points=user["points"],
+        ))
 
     @filter.command("签到")
     async def sign_in(self, event: AstrMessageEvent):
@@ -1096,10 +1192,19 @@ class PointsPlugin(Star):
         if lucky_bonus > 0:
             lucky_text = f"，签到幸运加成 {lucky_bonus}"
 
-        yield event.plain_result(
-            f"签到成功，{sender_name} 连续签到 {streak} 天，"
-            f"基础 {base_points} + 连签加成 {extra_bonus}{lucky_text} = {sign_points} 积分，当前积分 {user['points']}。"
-        )
+        tmpl = self._get_message_template("sign_in_message_template", self.DEFAULT_SIGN_IN_TEMPLATE)
+        yield event.plain_result(self._format_template(
+            tmpl,
+            name=sender_name,
+            streak=streak,
+            base=base_points,
+            extra=extra_bonus,
+            luck=0 if lucky_bonus == 0 else lucky_bonus,
+            lucky=lucky_bonus,
+            lucky_text=lucky_text,
+            total=sign_points,
+            points=user["points"],
+        ))
 
     @filter.command("查询", alias={"余额", "我的积分"})
     async def query_points(self, event: AstrMessageEvent, qq: str = ""):
@@ -1155,6 +1260,81 @@ class PointsPlugin(Star):
         for idx, (uid, name, points) in enumerate(ranking[:top_n], start=1):
             lines.append(f"{idx}. {name}({uid}) - {points}")
         yield event.plain_result("\n".join(lines))
+
+    def _render_speech_leaderboard(
+        self, data: dict[str, Any], period: str, label: str, top_n: int = 10,
+    ) -> list[str]:
+        speech_map = data.get(f"speech_{period}", {})
+        if not isinstance(speech_map, dict):
+            return [f"{label}暂无数据。"]
+
+        period_data: Any = {}
+        if period == "total":
+            period_data = speech_map.get("__total__", {})
+        elif period == "daily":
+            period_data = speech_map.get(date.today().isoformat(), {})
+        elif period == "weekly":
+            iso = date.today().isocalendar()
+            period_data = speech_map.get(f"{iso[0]}-W{iso[1]:02d}", {})
+        elif period == "monthly":
+            period_data = speech_map.get(date.today().isoformat()[:7], {})
+
+        rows = self._flatten_speech_rows(period_data)
+        if not rows:
+            return [f"{label}暂无数据。"]
+        top_n = max(1, min(top_n, 50))
+        lines = [f"{label}（前 {min(top_n, len(rows))} 名）："]
+        for idx, (group_id, name, uid, count) in enumerate(rows[:top_n], start=1):
+            lines.append(f"{idx}. {name}({uid}) [{group_id}] - {count} 条")
+        return lines
+
+    @filter.command("发言日榜", alias={"发言榜", "发言日报"})
+    async def rank_speech_daily(self, event: AstrMessageEvent, top_n: int = 0):
+        """查看今日群成员发言排行榜。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+        if top_n <= 0:
+            top_n = self._cfg_int("leaderboard_default_size", 10, 1, 50)
+        data = await self._load_data()
+        yield event.plain_result("\n".join(self._render_speech_leaderboard(data, "daily", "今日发言榜", top_n)))
+
+    @filter.command("发言周榜")
+    async def rank_speech_weekly(self, event: AstrMessageEvent, top_n: int = 0):
+        """查看本周群成员发言排行榜。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+        if top_n <= 0:
+            top_n = self._cfg_int("leaderboard_default_size", 10, 1, 50)
+        data = await self._load_data()
+        yield event.plain_result("\n".join(self._render_speech_leaderboard(data, "weekly", "本周发言榜", top_n)))
+
+    @filter.command("发言月榜")
+    async def rank_speech_monthly(self, event: AstrMessageEvent, top_n: int = 0):
+        """查看本月群成员发言排行榜。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+        if top_n <= 0:
+            top_n = self._cfg_int("leaderboard_default_size", 10, 1, 50)
+        data = await self._load_data()
+        yield event.plain_result("\n".join(self._render_speech_leaderboard(data, "monthly", "本月发言榜", top_n)))
+
+    @filter.command("发言总榜")
+    async def rank_speech_total(self, event: AstrMessageEvent, top_n: int = 0):
+        """查看群成员历史总发言排行榜（自插件记录以来）。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+        if top_n <= 0:
+            top_n = self._cfg_int("leaderboard_default_size", 10, 1, 50)
+        data = await self._load_data()
+        yield event.plain_result("\n".join(self._render_speech_leaderboard(data, "total", "历史总发言榜", top_n)))
 
     @filter.command("抽奖")
     async def lottery_draw(self, event: AstrMessageEvent, times: int = 1):
@@ -1558,6 +1738,52 @@ class PointsPlugin(Star):
         self._change_points(user, -points)
         await self._save_data(data)
         yield event.plain_result(f"已扣除 {qq} {points} 积分，当前 {user['points']}。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("全员加分")
+    async def admin_mass_add_points(self, event: AstrMessageEvent, points: int):
+        """管理员给所有用户增加积分。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+        if points <= 0:
+            yield event.plain_result("加分数值必须大于 0。")
+            return
+
+        data = await self._load_data()
+        users = data["users"]
+        count = 0
+        for uid in list(users.keys()):
+            user = users.get(uid)
+            if isinstance(user, dict):
+                self._change_points(user, points)
+                count += 1
+        await self._save_data(data)
+        yield event.plain_result(f"已为 {count} 名用户各增加 {points} 积分。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("全员扣分")
+    async def admin_mass_sub_points(self, event: AstrMessageEvent, points: int):
+        """管理员扣除所有用户的积分。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+        if points <= 0:
+            yield event.plain_result("扣分数值必须大于 0。")
+            return
+
+        data = await self._load_data()
+        users = data["users"]
+        count = 0
+        for uid in list(users.keys()):
+            user = users.get(uid)
+            if isinstance(user, dict):
+                self._change_points(user, -points)
+                count += 1
+        await self._save_data(data)
+        yield event.plain_result(f"已为 {count} 名用户各扣除 {points} 积分。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("设置概率")
