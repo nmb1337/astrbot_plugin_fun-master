@@ -142,6 +142,12 @@
     "type": "list",
     "default": []
   },
+  "redeem_product_points": {
+    "description": "各商品位所需积分列表（与 redeem_products 一一对应）",
+    "hint": "例如 [100,200,50] 表示商品1需100积分、商品2需200积分、商品3需50积分。留空则各商品默认使用 redeem_cost_points。",
+    "type": "list",
+    "default": []
+  },
   "group_enable_private": {
     "description": "私聊是否启用积分功能",
     "hint": "当关闭时，私聊中所有积分相关指令不可用。",

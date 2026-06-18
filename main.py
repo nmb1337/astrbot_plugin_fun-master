@@ -481,7 +481,7 @@ class PointsPlugin(Star):
             result = result.replace("{" + key + "}", str(value))
         return result
 
-    def _get_redeem_products(self, data: dict[str, Any]) -> list[str]:
+    def _get_redeem_product_raw_names(self, data: dict[str, Any]) -> list[str]:
         settings = data["settings"]
         config_products = []
         if isinstance(self.config, dict):
@@ -519,6 +519,36 @@ class PointsPlugin(Star):
             products.append(f"商品{len(products) + 1}")
         return products
 
+    def _get_redeem_product_points_list(self, data: dict[str, Any]) -> list[int]:
+        settings = data["settings"]
+        config_points = []
+        if isinstance(self.config, dict):
+            config_points = self.config.get("redeem_product_points", [])
+        raw_points = settings.get("redeem_product_points", config_points)
+        default_point = max(1, self._to_int(
+            settings.get("redeem_cost"),
+            self._cfg_int("redeem_cost_points", 100, 1),
+        ))
+        points: list[int] = []
+        if isinstance(raw_points, list):
+            for item in raw_points:
+                val = self._to_int(item, 0)
+                points.append(max(1, val) if val > 0 else default_point)
+        return points
+
+    def _get_redeem_products(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        names = self._get_redeem_product_raw_names(data)
+        points_list = self._get_redeem_product_points_list(data)
+        default_point = max(1, self._to_int(
+            data["settings"].get("redeem_cost"),
+            self._cfg_int("redeem_cost_points", 100, 1),
+        ))
+        products: list[dict[str, Any]] = []
+        for idx, name in enumerate(names):
+            pts = points_list[idx] if idx < len(points_list) else default_point
+            products.append({"slot": idx + 1, "name": name, "points": max(1, pts)})
+        return products
+
     def _set_redeem_products(self, data: dict[str, Any], products: list[str]) -> None:
         slot_max = self._cfg_int(
             "dashboard_product_slots_max",
@@ -530,6 +560,16 @@ class PointsPlugin(Star):
         for idx, item in enumerate(products[:slot_max], start=1):
             normalized.append(self._sanitize_product_name(item, f"商品{idx}"))
         data["settings"]["redeem_products"] = normalized
+
+    def _set_redeem_product_points(self, data: dict[str, Any], points: list[int]) -> None:
+        normalized: list[int] = [max(1, v) for v in points]
+        data["settings"]["redeem_product_points"] = normalized
+
+    def _find_product(self, data: dict[str, Any], slot: int) -> dict[str, Any] | None:
+        products = self._get_redeem_products(data)
+        if 1 <= slot <= len(products):
+            return products[slot - 1]
+        return None
 
     def _get_lottery_settings(self, data: dict[str, Any]) -> dict[str, Any]:
         settings = data["settings"]
@@ -744,13 +784,27 @@ class PointsPlugin(Star):
             self._dashboard_redirect("无效商品位")
 
         data = await self._load_data()
-        products = self._get_redeem_products(data)
-        if slot > len(products):
+        names = self._get_redeem_product_raw_names(data)
+        if slot > len(names):
             self._dashboard_redirect("商品位不存在")
 
         name = self._sanitize_product_name(post_data.get("name", ""), f"商品{slot}")
-        products[slot - 1] = name
-        self._set_redeem_products(data, products)
+        names[slot - 1] = name
+        self._set_redeem_products(data, names)
+
+        new_points = self._to_int(post_data.get("points", 0), 0)
+        if new_points > 0:
+            points_list = self._get_redeem_product_points_list(data)
+            while len(points_list) < len(names):
+                points_list.append(max(1, self._to_int(
+                    data["settings"].get("redeem_cost"),
+                    self._cfg_int("redeem_cost_points", 100, 1),
+                )))
+            points_list[slot - 1] = max(1, new_points)
+            while len(points_list) > len(names):
+                points_list.pop()
+            self._set_redeem_product_points(data, points_list)
+
         await self._save_data(data)
         self._dashboard_redirect(f"商品位 #{slot} 已更新")
 
@@ -760,7 +814,7 @@ class PointsPlugin(Star):
             return web.Response(status=401, text="Unauthorized")
 
         data = await self._load_data()
-        products = self._get_redeem_products(data)
+        names = self._get_redeem_product_raw_names(data)
         slot_max = self._cfg_int(
             "dashboard_product_slots_max",
             self.DEFAULT_PRODUCT_SLOT_MAX,
@@ -768,13 +822,26 @@ class PointsPlugin(Star):
             100,
         )
 
-        if len(products) >= slot_max:
+        if len(names) >= slot_max:
             self._dashboard_redirect(f"商品位已达上限（{slot_max}）")
 
-        new_slot = len(products) + 1
+        new_slot = len(names) + 1
         name = self._sanitize_product_name(post_data.get("name", ""), f"商品{new_slot}")
-        products.append(name)
-        self._set_redeem_products(data, products)
+        names.append(name)
+        self._set_redeem_products(data, names)
+
+        new_points = self._to_int(post_data.get("points", 0), 0)
+        default_pts = max(1, self._to_int(
+            data["settings"].get("redeem_cost"),
+            self._cfg_int("redeem_cost_points", 100, 1),
+        ))
+        points_list = self._get_redeem_product_points_list(data)
+        while len(points_list) < len(names):
+            points_list.append(default_pts)
+        if new_points > 0:
+            points_list[new_slot - 1] = max(1, new_points)
+        self._set_redeem_product_points(data, points_list)
+
         await self._save_data(data)
         self._dashboard_redirect(f"已新增商品位 #{new_slot}")
 
@@ -947,30 +1014,36 @@ class PointsPlugin(Star):
         if dashboard_token:
             token_input = f'<input type="hidden" name="token" value="{escape(dashboard_token)}">'
 
-        for idx, name in enumerate(products, start=1):
+        for prod in products:
+            slot = prod["slot"]
+            name = prod["name"]
+            pts = prod["points"]
             product_rows.append(
                 "<tr>"
-                f"<td>{idx}</td>"
+                f"<td>{slot}</td>"
                 f"<td>{escape(name)}</td>"
+                f"<td>{pts}</td>"
                 "<td>"
                 '<form method="post" action="/products/update" class="inline-form">'
                 f"{token_input}"
-                f'<input type="hidden" name="slot" value="{idx}">'
-                f'<input type="text" name="name" value="{escape(name)}" maxlength="40">'
+                f'<input type="hidden" name="slot" value="{slot}">'
+                f'<input type="text" name="name" value="{escape(name)}" maxlength="40" style="min-width:140px;">'
+                f'<input type="number" name="points" value="{pts}" min="1" max="999999" style="width:80px;">'
                 '<button type="submit">保存</button>'
                 "</form>"
                 "</td>"
                 "</tr>"
             )
         if not product_rows:
-            product_rows.append('<tr><td colspan="3">暂无商品位</td></tr>')
+            product_rows.append('<tr><td colspan="4">暂无商品位</td></tr>')
 
         add_product_form = ""
         if len(products) < product_slot_max:
             add_product_form = (
                 '<form method="post" action="/products/add" class="inline-form">'
                 f"{token_input}"
-                '<input type="text" name="name" placeholder="新商品名（可留空自动命名）" maxlength="40">'
+                '<input type="text" name="name" placeholder="新商品名（可留空自动命名）" maxlength="40" style="min-width:140px;">'
+                '<input type="number" name="points" placeholder="所需积分" min="1" max="999999" style="width:100px;">'
                 '<button type="submit">新增商品位</button>'
                 "</form>"
             )
@@ -1020,9 +1093,9 @@ class PointsPlugin(Star):
             f"<div class=\"meta\">总发言：{total_all} 条，展示前 200 名</div>"
             "<table><thead><tr><th>排名</th><th>群号</th><th>昵称</th><th>QQ</th><th>发言次数</th></tr></thead>"
             f"<tbody>{''.join(speech_total_rows)}</tbody></table></div>"
-            "<div class=\"card\"><h2>兑换商品位（可自定义名称）</h2>"
+            "<div class=\"card\"><h2>兑换商品位（可自定义名称与积分）</h2>"
             f"<div class=\"meta\">当前商品位：{len(products)} / {product_slot_max}</div>"
-            "<table><thead><tr><th>商品位</th><th>商品名称</th><th>编辑</th></tr></thead>"
+            "<table><thead><tr><th>商品位</th><th>商品名称</th><th>所需积分</th><th>编辑</th></tr></thead>"
             f"<tbody>{''.join(product_rows)}</tbody></table>"
             f"{add_product_form}</div>"
             "<div class=\"card\"><h2>兑换申请与记录</h2>"
@@ -1475,6 +1548,106 @@ class PointsPlugin(Star):
 
         yield event.plain_result(f"兑换申请已创建，但未识别到有效通知QQ。{notify_text}")
 
+    @filter.command("商品", alias={"商品列表", "兑换列表"})
+    async def list_products(self, event: AstrMessageEvent):
+        """查看当前可兑换商品列表。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
+        sender_id = str(event.get_sender_id())
+        data = await self._load_data()
+        products = self._get_redeem_products(data)
+        sender_user = self._ensure_user(data, sender_id)
+        current_points = self._to_int(sender_user.get("points", 0), 0)
+
+        lines = [f"可兑换商品列表（你的积分：{current_points}）："]
+        for prod in products:
+            lines.append(f"{prod['slot']}. {prod['name']} — {prod['points']} 积分")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("兑换商品")
+    async def redeem_product(self, event: AstrMessageEvent, slot: int, note: str = ""):
+        """兑换指定商品位的商品，扣除该商品对应的积分。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
+        if slot <= 0:
+            yield event.plain_result("商品位编号必须大于 0，请使用 /商品 查看可兑换列表。")
+            return
+
+        sender_id = str(event.get_sender_id())
+        sender_name = event.get_sender_name() or sender_id
+        data = await self._load_data()
+        sender_user = self._ensure_user(data, sender_id, sender_name)
+
+        product = self._find_product(data, slot)
+        if not product:
+            yield event.plain_result(f"商品位 #{slot} 不存在，请使用 /商品 查看可兑换列表。")
+            return
+
+        product_name = product["name"]
+        product_points = product["points"]
+
+        if sender_user["points"] < product_points:
+            yield event.plain_result(
+                f"积分不足，兑换「{product_name}」需要 {product_points} 积分，"
+                f"当前 {sender_user['points']}。"
+            )
+            return
+
+        self._change_points(sender_user, -product_points)
+
+        order_id = data["redeem_seq"] + 1
+        data["redeem_seq"] = order_id
+        reason = f"兑换商品 #{slot}「{product_name}」"
+        if note:
+            reason += f"（{note}）"
+
+        order = {
+            "id": order_id,
+            "status": "已申请",
+            "user_id": sender_id,
+            "user_name": sender_name,
+            "cost": product_points,
+            "reason": reason,
+            "created_at": self._now_str(),
+            "updated_at": self._now_str(),
+            "handler_id": "",
+            "handler_name": "",
+            "note": note,
+        }
+        data["redeems"].append(order)
+        if len(data["redeems"]) > 1000:
+            data["redeems"] = data["redeems"][-1000:]
+
+        await self._save_data(data)
+
+        _, notify_qq = self._get_redeem_settings(data)
+        notify_text = (
+            f"兑换申请 #{order_id}（状态：已申请）：{sender_name}({sender_id})"
+            f" 使用 {product_points} 积分兑换「{product_name}」。"
+            f"剩余积分 {sender_user['points']}。"
+        )
+
+        if notify_qq:
+            if self._get_event_group_id(event):
+                yield event.chain_result(self._build_notify_chain(notify_qq, notify_text))
+            else:
+                yield event.plain_result(notify_text)
+
+            private_sent, private_err = await self._notify_private_qq(event, notify_qq, notify_text)
+            if private_sent:
+                yield event.plain_result(f"已私聊通知 {notify_qq}。")
+            else:
+                yield event.plain_result(f"群内提醒已发送，但私聊通知失败：{private_err}")
+            return
+
+        yield event.plain_result(f"兑换申请已创建。{notify_text}")
+
     @filter.command("兑换状态")
     async def redeem_status(self, event: AstrMessageEvent, order_id: int = 0):
         """查询兑换审核状态。"""
@@ -1898,6 +2071,42 @@ class PointsPlugin(Star):
         yield event.plain_result(f"兑换所需积分已设置为 {cost_points}。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("设置商品积分")
+    async def admin_set_product_points(self, event: AstrMessageEvent, slot: int, points: int):
+        """管理员设置指定商品位的所需积分。"""
+        blocked = self._blocked_result(event)
+        if blocked is not None:
+            yield blocked
+            return
+
+        if slot <= 0:
+            yield event.plain_result("商品位编号必须大于 0。")
+            return
+        if points <= 0:
+            yield event.plain_result("商品积分必须大于 0。")
+            return
+
+        data = await self._load_data()
+        names = self._get_redeem_product_raw_names(data)
+        if slot > len(names):
+            yield event.plain_result(f"商品位 #{slot} 不存在，当前共 {len(names)} 个商品位。")
+            return
+
+        points_list = self._get_redeem_product_points_list(data)
+        default_pts = max(1, self._to_int(
+            data["settings"].get("redeem_cost"),
+            self._cfg_int("redeem_cost_points", 100, 1),
+        ))
+        while len(points_list) < len(names):
+            points_list.append(default_pts)
+        points_list[slot - 1] = max(1, points)
+        while len(points_list) > len(names):
+            points_list.pop()
+        self._set_redeem_product_points(data, points_list)
+        await self._save_data(data)
+        yield event.plain_result(f"商品位 #{slot}「{names[slot - 1]}」所需积分已设置为 {max(1, points)}。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("设置兑换通知")
     async def admin_set_redeem_notify(self, event: AstrMessageEvent, notify_qq: str):
         """管理员设置兑换提醒 QQ。"""
@@ -2056,6 +2265,10 @@ class PointsPlugin(Star):
         pity_threshold = self._get_lottery_pity_threshold(data)
         redeem_cost, redeem_notify_qq = self._get_redeem_settings(data)
         p1, p2, p3 = lottery["prizes"]
+        products = self._get_redeem_products(data)
+        product_lines = []
+        for prod in products:
+            product_lines.append(f"  #{prod['slot']} {prod['name']} — {prod['points']} 积分")
         yield event.plain_result(
             "当前积分配置：\n"
             f"- 聊天触发概率：{chance}%\n"
@@ -2072,7 +2285,8 @@ class PointsPlugin(Star):
             f"- 抽奖保底阈值：{pity_threshold}（0 为关闭）\n"
             f"- 奖项总概率：{lottery['total_chance']}%\n"
             f"- 固定兑换积分：{redeem_cost}\n"
-            f"- 兑换通知 QQ：{redeem_notify_qq or '未设置'}"
+            f"- 兑换通知 QQ：{redeem_notify_qq or '未设置'}\n"
+            f"- 可兑换商品：\n" + "\n".join(product_lines)
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
